@@ -48,6 +48,10 @@
     edit: '<path d="M4 20h4l10-10-4-4L4 16z"/><path d="m13 7 4 4"/>',
     refresh: '<path d="M20 11a8 8 0 0 0-14.5-4M4 13a8 8 0 0 0 14.5 4"/><path d="M20 4v7h-7M4 20v-7h7"/>',
     sparkle: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 17l.8 2.2L22 20l-2.2.8L19 23l-.8-2.2L16 20l2.2-.8z"/>',
+    camera: '<path d="M3 8a2 2 0 0 1 2-2h2l2-3h6l2 3h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.5"/>',
+    mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
+    send: '<path d="m4.5 11.5 15-7-4.2 14-3.3-5.6z"/><path d="M12 13l7.5-8.5"/>',
+    speaker: '<path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/>',
   };
   const icon = (name, cls = '') => `<svg class="ic-svg ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
 
@@ -195,7 +199,7 @@
   // In-memory route is the source of truth; location.hash is synced best-effort so the
   // app also works inside sandboxed iframes / previews where hash navigation may be blocked.
   const Views = {};
-  const TAB_FOR = { home: 'home', weight: 'weight', diet: 'diet', guide: 'guide', me: 'me', calendar: 'guide', week: 'guide', kicks: 'guide', contractions: 'guide', exercise: 'home', tools: 'home', report: 'me' };
+  const TAB_FOR = { home: 'home', weight: 'weight', diet: 'diet', guide: 'guide', me: 'me', calendar: 'guide', week: 'guide', kicks: 'guide', contractions: 'guide', exercise: 'home', tools: 'home', report: 'me', ai: 'home' };
   let route = '#/home';
   const history_ = [];
   function readHash() { try { return location.hash || ''; } catch (e) { return ''; } }

@@ -20,6 +20,7 @@
     return `${UI.topbar(t('t.title'))}
       <button class="sos" data-go="#/tools/sos" id="btn-sos"><span class="ic">${icon('phone')}</span><div><b>${esc(t('t.sos'))}</b><span>${country.flag} ${esc(t('t.sos.call', { n: country.emergency }))}</span></div></button>
       <section class="card mt-3"><div class="list">
+        <a class="list-item" href="#/ai"><div class="lead" style="background:var(--accent-soft);color:hsl(18 65% 42%)">${icon('sparkle')}</div><div class="body"><div class="title">${esc(t('t.ai'))}</div><div class="sub">${esc(t('t.ai.sub'))}</div></div>${icon('chevR', 'chev')}</a>
         <a class="list-item" href="#/tools/bp"><div class="lead">${icon('heart')}</div><div class="body"><div class="title">${esc(t('t.bp'))}</div><div class="sub">${lastBp ? `${lastBp.sys}/${lastBp.dia} mmHg · ${esc(UI.fmtDate(lastBp.ts))}` : esc(t('t.empty'))}</div></div>${icon('chevR', 'chev')}</a>
         <a class="list-item" href="#/tools/glucose"><div class="lead">${icon('drop')}</div><div class="body"><div class="title">${esc(t('t.glucose'))}</div><div class="sub">${lastGlu ? `${esc(fmtGlucose(lastGlu.mmol))} · ${esc(t('t.glu.' + lastGlu.type))}` : esc(t('t.empty'))}</div></div>${icon('chevR', 'chev')}</a>
         <a class="list-item" href="#/tools/symptoms"><div class="lead">${icon('pulse')}</div><div class="body"><div class="title">${esc(t('t.symptoms'))}</div><div class="sub">${lastSym ? lastSym.tags.map(x => t('t.sym.' + x)).join(', ') + ' · ' + UI.fmtDate(lastSym.ts) : esc(t('t.empty'))}</div></div>${icon('chevR', 'chev')}</a>

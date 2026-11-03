@@ -145,11 +145,49 @@
     F('dhacap', 'DHA 胶囊', 'DHA capsule', 1, 10, 0, 0, 1, 0, 0, 0, 0, 200, 0, 'both', ['supplement']),
   ];
   // Supplements store per-unit values; everything else is per 100 g.
+  // Dietary fibre per 100 g (supplements = 0), from 中国食物成分表 / USDA SR Legacy approximations.
+  const FIBER = {
+    rice: 0.3, brownrice: 1.8, mantou: 1.9, noodles: 1.5, millet: 0.8, oats: 10.0, wwbread: 6.0, sweetpotato: 3.0,
+    pasta: 1.8, cereal: 6.0, dumplings: 1.2, baozi: 1.5,
+    egg: 0, milk: 0, yogurt: 0, greekyogurt: 0, cheddar: 0, tofu: 0.3, soymilk: 0.3,
+    pork: 0, beef: 0, chicken: 0, salmon: 0, hairtail: 0, sardines: 0, tuna: 0, shrimp: 0, liver: 0,
+    lentils: 7.9, chickpeas: 7.6, edamame: 5.2, peanutbutter: 6.0,
+    spinach: 2.2, broccoli: 3.3, kale: 3.6, bokchoy: 0.8, tomatoegg: 1.0, kelp: 0.5, nori: 30.0, avocado: 6.7,
+    apple: 2.4, banana: 2.6, orange: 2.4, strawberry: 2.0, jujube: 7.0, walnut: 6.7, almonds: 12.5, oj: 0.2,
+    latte: 0, americano: 0, greentea: 0, milktea: 0.2, cola: 0,
+    pizza: 2.3, burger: 1.8, chickensalad: 1.2, stirfry: 1.2, congee: 0.3,
+    prenatal: 0, folicacid: 0, dhacap: 0,
+  };
+  FOODS.forEach(f => { f.fiber = f.tags.includes('supplement') ? 0 : (FIBER[f.id] != null ? FIBER[f.id] : 0); });
+
+  const NUT_KEYS = ['kcal', 'protein', 'carb', 'fat', 'fiber', 'folate', 'iron', 'calcium', 'iodine', 'dha', 'caffeine'];
   const foodNutrients = (food, grams) => {
     const factor = food.tags.includes('supplement') ? grams : grams / 100;
     const out = {};
-    ['kcal', 'protein', 'carb', 'fat', 'folate', 'iron', 'calcium', 'iodine', 'dha', 'caffeine'].forEach(k => { out[k] = (food[k] || 0) * factor; });
+    NUT_KEYS.forEach(k => { out[k] = (food[k] || 0) * factor; });
     return out;
+  };
+  // Free-form / AI-estimated food: custom values are stored per 100 g, scaled by grams.
+  const customNutrients = (c, grams) => {
+    const factor = (grams || 0) / 100;
+    const out = {};
+    ['kcal', 'protein', 'carb', 'fat', 'fiber'].forEach(k => { out[k] = (c[k] || 0) * factor; });
+    return out;
+  };
+  // Match a free-text food name (from AI or user) against the built-in food library.
+  const matchFood = name => {
+    const q = String(name || '').trim().toLowerCase();
+    if (!q) return null;
+    let best = null, bestScore = 0;
+    for (const f of FOODS) {
+      const zh = f.zh.toLowerCase(), en = f.en.toLowerCase();
+      let s = 0;
+      if (zh === q || en === q) s = 5;
+      else if (zh.includes(q) || en.includes(q)) s = 4;
+      else if (q.includes(zh) || q.includes(en)) s = 2; // e.g. “烤鸡胸肉” contains 鸡胸肉
+      if (s > bestScore) { bestScore = s; best = f; }
+    }
+    return bestScore >= 2 ? best : null;
   };
 
   // --- Food traffic light (PRD §6.3, §6.9) ----------------------------------------
@@ -279,5 +317,5 @@
   const dayOfYear = (d = new Date()) => Math.floor((d - new Date(d.getFullYear(), 0, 0)) / 86400000);
   const quoteOfDay = (offset = 0, d = new Date()) => QUOTES[((dayOfYear(d) + offset) % QUOTES.length + QUOTES.length) % QUOTES.length];
 
-  global.Content = { WEEKS, weekInfo, TRIMESTERS, FOODS, foodNutrients, TRAFFIC, MYTHS, SCENES, COURSES, QUOTES, quoteOfDay };
+  global.Content = { WEEKS, weekInfo, TRIMESTERS, FOODS, foodNutrients, customNutrients, matchFood, TRAFFIC, MYTHS, SCENES, COURSES, QUOTES, quoteOfDay };
 })(window);

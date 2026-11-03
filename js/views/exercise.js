@@ -37,7 +37,7 @@
       </section>
       <section class="card mt-3 flat" style="background:var(--danger-soft)"><div class="bold" style="color:var(--danger)">${esc(t('e.stop.t'))}</div><p class="small muted mt-1">${esc(t('e.stop.d'))}</p></section>
       <section class="card mt-3"><div class="card-head"><h2 class="card-title">${esc(t('e.history'))}</h2><button class="btn sm ghost" data-act="rescreen">${esc(t('e.rescreen'))}</button></div>
-        ${recent.length ? `<div class="list">${recent.map(w => `<div class="list-item"><div class="body"><div class="title">${esc(t('e.type.' + w.type))}</div><div class="sub">${esc(UI.fmtRelDay(w.date))}</div></div><div class="trail"><span>${w.minutes} ${esc(t('c.min'))}</span><button class="btn icon ghost" data-del="${w.ts}" aria-label="${esc(t('c.delete'))}">${icon('trash')}</button></div></div>`).join('')}</div>` : `<p class="muted small">${esc(t('e.empty'))}</p>`}
+        ${recent.length ? `<div class="list">${recent.map(w => `<div class="list-item" ${w.photoId ? `data-photoview="${w.photoId}" role="button" tabindex="0" title="${esc(t('photo.privacy'))}"` : ''}>${w.photoId ? `<img class="meal-thumb" data-photo="${w.photoId}" alt="${esc(t('e.photo'))}">` : ''}<div class="body"><div class="title">${esc(t('e.type.' + w.type))}</div><div class="sub">${esc(UI.fmtRelDay(w.date))}</div></div><div class="trail"><span>${w.minutes} ${esc(t('c.min'))}</span><button class="btn icon ghost" data-del="${w.ts}" aria-label="${esc(t('c.delete'))}">${icon('trash')}</button></div></div>`).join('')}</div>` : `<p class="muted small">${esc(t('e.empty'))}</p>`}
       </section>`;
   }
 
@@ -56,14 +56,17 @@
       body: `<div class="stack"><div class="field"><label for="ex-type">${esc(t('e.courses'))}</label><select class="input" id="ex-type">${TYPES.map(x => `<option value="${x}" ${x === type ? 'selected' : ''}>${esc(t('e.type.' + x))}</option>`).join('')}</select></div>
         <div class="field"><label for="ex-min">${esc(t('e.minutes'))}</label><input class="input" type="number" id="ex-min" inputmode="numeric" value="${minutes}" min="1" max="300"></div>
         <div class="row" style="gap:8px">${[15, 20, 30, 45, 60].map(m => `<button class="chip selectable" data-m="${m}">${m}</button>`).join('')}</div>
-        <div class="field"><label for="ex-date">${esc(t('w.add.date'))}</label><input class="input" type="date" id="ex-date" value="${Store.todayStr()}" max="${Store.todayStr()}"></div></div>`,
+        <div class="field"><label for="ex-date">${esc(t('w.add.date'))}</label><input class="input" type="date" id="ex-date" value="${Store.todayStr()}" max="${Store.todayStr()}"></div>
+        <div class="mt-2">${Photos.pickerHTML('ex-photo', t('photo.add'), true)}</div></div>`,
       actions: `<button class="btn secondary" data-close>${esc(t('c.cancel'))}</button><button class="btn primary" data-save>${esc(t('c.save'))}</button>`,
       onMount(s, close) {
+        let photoId = null;
+        Photos.bindPicker(s, 'ex-photo', id => { photoId = id; });
         s.querySelectorAll('[data-m]').forEach(c => c.addEventListener('click', () => { s.querySelector('#ex-min').value = c.dataset.m; }));
         s.querySelector('[data-save]').addEventListener('click', () => {
           const m = +s.querySelector('#ex-min').value, ty = s.querySelector('#ex-type').value, date = s.querySelector('#ex-date').value;
           if (!m || !date) return;
-          Store.update(x => { x.workouts.push({ date, type: ty, minutes: m, ts: Date.now() }); });
+          Store.update(x => { x.workouts.push(Object.assign({ date, type: ty, minutes: m, ts: Date.now() }, photoId ? { photoId } : {})); });
           close(); toast(t('e.logged', { n: m }), 'ok'); UI.render();
         });
       },
@@ -72,6 +75,8 @@
 
   function mount(root) {
     root.addEventListener('click', async e => {
+      const pv = e.target.closest('[data-photoview]');
+      if (pv && !e.target.closest('button')) { Photos.viewer(pv.dataset.photoview); return; }
       const b = e.target.closest('button'); if (!b) return;
       const d = b.dataset;
       if (d.flag) { if (d.flag === 'none') draftFlags = []; else { const i = draftFlags.indexOf(d.flag); i >= 0 ? draftFlags.splice(i, 1) : draftFlags.push(d.flag); } UI.render(); }
@@ -81,6 +86,7 @@
       else if (d.quick) logSheet(d.quick, +d.min);
       else if (d.del) { Store.update(s => { s.workouts = s.workouts.filter(w => String(w.ts) !== d.del); }); UI.render(); }
     });
+    Photos.hydrate(root);
   }
   UI.Views.exercise = { render, mount };
 })();

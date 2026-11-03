@@ -134,17 +134,22 @@
     const e = energyTarget(state, date);
     return {
       kcal: e.total, protein: n.protein[i], carb: Math.round(e.total * 0.5 / 4), fat: Math.round(e.total * 0.3 / 9),
+      fiber: n.fiber || 28,
       folate: n.folate[i], iron: n.iron[i], calcium: n.calcium[i], iodine: n.iodine[i], dha: n.dha[i], caffeineMax: n.caffeineMax,
       sourceKey: n.sourceKey,
     };
   }
   function dayIntake(state, dateStr) {
-    const sum = { kcal: 0, protein: 0, carb: 0, fat: 0, folate: 0, iron: 0, calcium: 0, iodine: 0, dha: 0, caffeine: 0 };
+    const sum = { kcal: 0, protein: 0, carb: 0, fat: 0, fiber: 0, folate: 0, iron: 0, calcium: 0, iodine: 0, dha: 0, caffeine: 0 };
     for (const m of state.meals) {
       if (m.date !== dateStr) continue;
-      const food = Content.FOODS.find(f => f.id === m.foodId);
-      if (!food) continue;
-      const n = Content.foodNutrients(food, m.grams);
+      let n = null;
+      if (m.custom && m.grams) n = Content.customNutrients(m.custom, m.grams); // AI-estimated / free-form food
+      else {
+        const food = Content.FOODS.find(f => f.id === m.foodId);
+        if (!food) continue;
+        n = Content.foodNutrients(food, m.grams);
+      }
       for (const k in sum) sum[k] += n[k] || 0;
     }
     return sum;

@@ -66,6 +66,7 @@
         <div class="quote-src">— ${esc(L(q.src))}</div></section>`; })()}
 
       <nav class="quick mt-3" aria-label="Quick actions">
+        <button data-go="#/ai"><span class="ic coral">${icon('sparkle')}</span>${esc(t('home.quick.ai'))}</button>
         <button data-go="#/calendar"><span class="ic">${icon('calendar')}</span>${esc(t('home.quick.calendar'))}</button>
         <button data-go="#/exercise"><span class="ic sky">${icon('activity')}</span>${esc(t('home.quick.exercise'))}</button>
         <button data-go="#/tools"><span class="ic sun">${icon('pulse')}</span>${esc(t('home.quick.tools'))}</button>

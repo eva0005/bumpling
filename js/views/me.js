@@ -11,6 +11,7 @@
     if (sub === 'family') return familyView(st);
     if (sub === 'privacy') return privacyView(st);
     if (sub === 'loss') return lossView(st);
+    if (sub === 'ai') return aiCfgView(st);
     const g = Engine.gestAge(st.profile);
     const p = st.profile;
     const row = (href, ic, title, sub2, id) => `<a class="list-item" href="${href}" id="${id || ''}"><div class="lead">${icon(ic)}</div><div class="body"><div class="title">${esc(title)}</div>${sub2 ? `<div class="sub ellipsis">${esc(sub2)}</div>` : ''}</div>${icon('chevR', 'chev')}</a>`;
@@ -27,6 +28,7 @@
       </div></section>
       <section class="card mt-3"><div class="list">
         ${row('#/exercise', 'activity', t('e.title'), Engine.exerciseLocked(st) ? t('e.locked.t') : t('e.goal'))}
+        ${row('#/ai', 'sparkle', t('t.ai'), AI.configured() ? t('ai.badge.on') : t('ai.badge.off'))}
         ${row('#/tools', 'pulse', t('t.title'), t('t.bp') + ' · ' + t('t.glucose') + ' · ' + t('t.symptoms'))}
         ${row('#/calendar', 'calendar', t('g.calendar'), (function () { const n = Engine.nextCheckup(st); return n ? n.title + (n.daysUntil != null && n.daysUntil >= 0 ? ' · ' + t('home.checkup.in', { n: n.daysUntil, w: '' }).replace(/ ·\s*$/, '') : '') : t('home.checkup.none'); })())}
         ${row('#/report', 'file', t('m.report'), t('m.report.weekly') + ' · ' + t('m.report.print'))}
@@ -76,6 +78,19 @@
       <section class="card tint"><p class="small">${esc(t('m.loss.lead'))}</p>
         ${st.settings.lossMode ? `<div class="notice primary mt-2">${esc(t('m.loss.active'))}</div><button class="btn secondary block mt-2" data-act="loss-off">${esc(t('m.loss.disable'))}</button>` : `<button class="btn secondary block mt-3" data-act="loss-on" id="btn-loss-on">${icon('heart')}${esc(t('m.loss.enable'))}</button>`}</section>`;
   }
+  function aiCfgView(st) {
+    const c = st.settings.ai || { endpoint: '', key: '', model: '' };
+    return `${UI.topbar(t('ai.cfg'))}
+      <section class="card">
+        <div class="field"><label for="ai-endpoint">${esc(t('ai.cfg.endpoint'))}</label><input class="input" id="ai-endpoint" type="url" inputmode="url" placeholder="${esc(t('ai.cfg.ph.endpoint'))}" value="${esc(c.endpoint || '')}" autocomplete="off"></div>
+        <div class="field mt-2"><label for="ai-key">${esc(t('ai.cfg.key'))}</label><input class="input" id="ai-key" type="password" autocomplete="new-password" placeholder="sk-…" value="${esc(c.key || '')}"></div>
+        <div class="field mt-2"><label for="ai-model">${esc(t('ai.cfg.model'))}</label><input class="input" id="ai-model" type="text" placeholder="${esc(t('ai.cfg.ph.model'))}" value="${esc(c.model || '')}" autocomplete="off"></div>
+        <button class="btn primary block mt-3" data-act="ai-save">${esc(t('c.save'))}</button>
+        <button class="btn secondary block mt-2" data-act="ai-test">${icon('pulse')}${esc(t('ai.cfg.test'))}</button>
+        <p class="xs subtle mt-2">${esc(t('ai.cfg.img'))}</p>
+      </section>
+      <div class="card flat mt-3"><p class="xs muted">${esc(t('ai.cfg.note'))}</p><p class="xs muted mt-2">${esc(t('ai.offline.tip'))}</p></div>`;
+  }
 
   function download(name, text, type = 'application/json') {
     const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
@@ -108,6 +123,23 @@
       else if (d.act === 'wipe') { if (await UI.confirm(t('m.privacy.delete.confirm'), { danger: true, okText: t('c.delete') })) { Store.wipe(); I18N.set(Store.state.settings.lang); UI.go('#/onboarding'); } }
       else if (d.act === 'loss-on') { if (await UI.confirm(t('m.loss.confirm'))) { Store.update(s => { s.settings.lossMode = true; }); UI.go('#/home'); } }
       else if (d.act === 'loss-off') { Store.update(s => { s.settings.lossMode = false; }); UI.go('#/home'); }
+      else if (d.act === 'ai-save') {
+        const endpoint = root.querySelector('#ai-endpoint').value.trim();
+        const key = root.querySelector('#ai-key').value.trim();
+        const model = root.querySelector('#ai-model').value.trim();
+        Store.update(s => { s.settings.ai = { endpoint, key, model }; });
+        toast(t('c.saved'), 'ok'); UI.render();
+      }
+      else if (d.act === 'ai-test') {
+        const endpoint = root.querySelector('#ai-endpoint').value.trim();
+        const key = root.querySelector('#ai-key').value.trim();
+        const model = root.querySelector('#ai-model').value.trim();
+        Store.update(s => { s.settings.ai = { endpoint, key, model }; });
+        toast(t('ai.thinking'));
+        try { await AI.test(); toast(t('ai.cfg.ok'), 'ok'); }
+        catch (e) { toast(t('ai.err', { e: (e && (e.message || e)) }), 'danger'); }
+        UI.render();
+      }
     });
   }
   UI.Views.me = { render, mount };

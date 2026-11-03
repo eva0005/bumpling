@@ -26,6 +26,7 @@
       lossMode: false,
       reminderDays: 3,
       notify: false,
+      ai: { endpoint: '', key: '', model: '' },   // 小芽AI: optional bring-your-own OpenAI-compatible service
     },
     profile: {
       lmp: null, edd: null, heightCm: null, preWeightKg: null, age: null, multiple: false,
@@ -47,6 +48,7 @@
     exerciseScreen: null, // {ts, flags:[]}
     family: { code: null, perms: { week: true, checkup: true, alerts: true, weight: false } },
     weeklyGoalStreak: 0,
+    aiChat: [],       // {id, role:'user'|'ai', text, photoId?, ts} — capped in ui
   });
 
   let state = null;
