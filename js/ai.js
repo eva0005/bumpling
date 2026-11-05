@@ -1,273 +1,448 @@
 /* ==========================================================================
-   AI — 小芽AI service layer.
-   Two modes:
-   1. LLM mode  — user connects their own OpenAI-compatible /chat/completions
-                  endpoint (URL + key + model stored only on this device).
-                  Powers free-form Q&A (incl. voice→text) and photo analysis
-                  (any vision-capable model).
-   2. Offline   — built-in pregnancy knowledge base compiled from ACOG / NHS /
-                  WHO / Chinese DRIs public guidance. No network needed.
-   Nothing is sent anywhere unless the user explicitly configures a service.
+   AI — 小芽 AI provider layer (v1.2).
+   Talks to Google Gemini or any OpenAI-compatible /chat/completions endpoint
+   straight from the browser with the user's own key (stored on-device only,
+   see Store.exportJSON). Three structured tasks, all returning JSON:
+     ask()            pregnancy Q&A (text + photos + voice clip)
+     analyzeMeal()    one meal photo → foods, grams, kcal, P/C/F/fibre
+     importHistory()  screenshots / handwritten logs → meal & workout entries
+   A fully offline demo mode returns built-in samples so the UI can be tried
+   without a key. No DOM here except an off-screen canvas for image resizing.
    ========================================================================== */
 (function (global) {
   'use strict';
 
-  // --- Config -----------------------------------------------------------------
-  const cfg = () => (Store.state.settings.ai = Store.state.settings.ai || { endpoint: '', key: '', model: '' });
-  const configured = () => !!(cfg().endpoint && cfg().key && cfg().model);
+  const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+  const OPENAI_BASE = 'https://api.openai.com/v1';
+  const MEALS = ['breakfast', 'lunch', 'dinner', 'snack'];
+  const WORKOUT_TYPES = ['walk', 'yoga', 'swim', 'kegel', 'stretch', 'pelvic', 'breath', 'strength', 'other'];
 
-  async function chat(messages, { temperature = 0.4 } = {}) {
-    const c = cfg();
-    if (!configured()) throw new Error('not configured');
-    let res;
-    try {
-      res = await fetch(c.endpoint.replace(/\/+$/, '') + '/chat/completions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + c.key },
-        body: JSON.stringify({ model: c.model, messages, temperature }),
-      });
-    } catch (e) { throw new Error('network: ' + (e && e.message ? e.message : e)); }
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      throw new Error('HTTP ' + res.status + (body ? ' · ' + body.replace(/\s+/g, ' ').slice(0, 120) : ''));
-    }
-    const data = await res.json();
-    const text = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-    if (!text) throw new Error('empty response');
-    return String(text).trim();
+  class AIError extends Error {
+    constructor(code, detail) { super(code + (detail ? ': ' + detail : '')); this.code = code; this.detail = detail || ''; }
   }
 
-  // --- Prompting ----------------------------------------------------------------
-  function systemPrompt() {
+  const cfg = () => (Store.state.settings && Store.state.settings.ai) || {};
+  function status() { const a = cfg(); if (a.demo) return 'demo'; if (a.apiKey && a.consent) return 'ready'; return 'off'; }
+  const isReady = () => status() !== 'off';
+
+  // --- Images -------------------------------------------------------------------
+  function fileToDataURL(file) {
+    return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(new AIError('image')); r.readAsDataURL(file); });
+  }
+  function loadImage(src) {
+    return new Promise((res, rej) => { const im = new Image(); im.onload = () => res(im); im.onerror = () => rej(new AIError('image')); im.src = src; });
+  }
+  // Downscale to maxDim (longest side) JPEG — keeps uploads small and localStorage thumbnails tiny.
+  async function compressImage(src, maxDim = 1024, quality = 0.82) {
+    const dataURL = typeof src === 'string' ? src : await fileToDataURL(src);
+    try {
+      const im = await loadImage(dataURL);
+      const scale = Math.min(1, maxDim / Math.max(im.naturalWidth || im.width, im.naturalHeight || im.height));
+      const w = Math.max(1, Math.round((im.naturalWidth || im.width) * scale)), h = Math.max(1, Math.round((im.naturalHeight || im.height) * scale));
+      const c = document.createElement('canvas'); c.width = w; c.height = h;
+      const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); ctx.drawImage(im, 0, 0, w, h);
+      return c.toDataURL('image/jpeg', quality);
+    } catch (e) {
+      if (/^data:image\//.test(dataURL)) return dataURL; // canvas unavailable: send as-is
+      throw new AIError('image');
+    }
+  }
+  const thumb = src => compressImage(src, 160, 0.7);
+  function splitDataURL(d) { const m = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(d || ''); if (!m) throw new AIError('image'); return { mime: m[1] || 'application/octet-stream', b64: m[2] ? m[3] : btoa(unescape(encodeURIComponent(decodeURIComponent(m[3])))) }; }
+
+  // --- Context shared with the model (never weight values or names) -------------------
+  function context() {
     const st = Store.state;
-    const g = Engine.gestAge(st.profile);
-    const lines = [
-      '你是「小芽AI」，一款科学、温和的孕期助手。',
-      '用户情况：' + (g ? `孕 ${g.weeks} 周⁺${g.rem} 天（孕${ ['', '早', '中', '晚'][g.trimester] }期，采用${t('region.' + st.settings.region)}）` : '孕周未设置'),
-      st.settings.gdmMode ? '用户开启了妊娠期糖尿病（GDM）模式。' : '',
-      statusContext(),
-      '回答规则：',
-      '1. 依据循证医学（ACOG、NHS、NICE、WHO、中国 DRIs/WS/T 801 等）给出直接、具体、可执行的建议，并简要解释科学原因。',
-      '2. 涉及出血、破水、剧烈腹痛、胎动明显减少、剧烈头痛/视物模糊、抽搐、高热等情况时，第一句就明确建议立即就医。',
-      '3. 不做诊断，不开处方；用药问题建议咨询医生或药师；不确定时如实说明。',
-      '4. 用用户使用的语言回答（中文问中文答，英文问英文答）；简洁分点，控制在 250 字以内；结尾不用寒暄。',
-    ].filter(Boolean);
+    const a = cfg();
+    const lang = I18N.lang === 'zh' ? 'Simplified Chinese (简体中文)' : 'English';
+    const lines = [`Answer language: ${lang}.`, `Today: ${Store.todayStr()}.`];
+    if (a.shareContext !== false) {
+      const g = Engine.gestAge(st.profile);
+      if (g) lines.push(`User is pregnant, gestational age ${g.weeks}w${g.rem}d (trimester ${g.trimester}).`);
+      lines.push(`Regional guideline pack: ${st.settings.region} (${t('region.' + st.settings.region + '.src')}).`);
+      const cond = (st.profile.conditions || []).slice(); if (st.settings.gdmMode) cond.push('gestational diabetes mode on');
+      if (st.profile.multiple) cond.push('multiple pregnancy');
+      if (cond.length) lines.push(`Known conditions: ${cond.join(', ')}.`);
+    }
     return lines.join('\n');
   }
-  function statusContext() {
-    try {
-      const st = Store.state, today = Store.todayStr();
-      const intake = Engine.dayIntake(st, today), tg = Engine.nutrientTargets(st);
-      const min = Engine.weekMinutes(st);
-      return `当前记录：今日已摄入约 ${Math.round(intake.kcal)}/${tg.kcal} kcal、蛋白质 ${Math.round(intake.protein)}/${tg.protein} g；本周运动 ${min}/${Standards.THRESHOLDS.activityMinPerWeek} 分钟。`;
-    } catch (e) { return ''; }
-  }
 
-  // Free-form Q&A with photo (vision-capable models). history: prior turns [{role, text}].
-  async function chatWithHistory(text, photoDataUrl, history = []) {
-    const msgs = [{ role: 'system', content: systemPrompt() }];
-    for (const m of history.slice(-8)) {
-      if (m.text) msgs.push({ role: m.role === 'user' ? 'user' : 'assistant', content: String(m.text).slice(0, 900) });
-    }
-    msgs.push({ role: 'user', content: photoDataUrl ? [
-      { type: 'text', text: text || t('ai.photo') },
-      { type: 'image_url', image_url: { url: photoDataUrl, detail: 'auto' } },
-    ] : text });
-    return await chat(msgs, { temperature: 0.4 });
-  }
+  // --- Prompts -----------------------------------------------------------------------
+  const SYS_CHAT = `You are 小芽 (Bumpling), a warm, evidence-based pregnancy companion inside a pregnancy tracking app.
+Scope: food & drink safety, skincare/cosmetic ingredients, medications (general guidance only), daily life, exercise, symptoms, emotional wellbeing during pregnancy and postpartum.
+Rules:
+- Ground answers in mainstream guidelines (ACOG, NICE/NHS, WHO, 中华医学会, 中国营养学会 DRIs, FDA/EFSA/国家药监局 for cosmetics). Prefer conservative, practical advice; say when evidence is limited.
+- Never diagnose, never prescribe doses of prescription drugs, never tell the user to stop a prescribed medicine. For red-flag symptoms (bleeding, fluid leak, severe headache/vision changes, reduced fetal movement, severe abdominal pain, fever ≥38°C) set seekCare=true and tell her to contact her clinician / emergency services.
+- If a photo is attached, identify the product/food/label first (read ingredient lists carefully), then answer about it. If audio is attached, first transcribe the question into "transcript".
+- Be concise: a short direct verdict, then 2–5 key points. Use plain language.
+Return ONLY a JSON object:
+{"verdict":"yes"|"caution"|"no"|"info","title":"<=14 words headline","answer":"main answer; **bold** and '- ' bullets allowed","tips":["<=3 short practical tips"],"sources":["<=3 short guideline references, e.g. ACOG FAQ 2023, NHS 2024"],"seekCare":false,"transcript":"question transcribed from audio, else empty"}`;
 
-  // Small connectivity test for the settings page.
-  async function test() { return await chat([{ role: 'user', content: 'Reply with exactly: OK' }], { temperature: 0 }); }
+  const MICRO = 'folate (µg), iron (mg), calcium (mg), iodine (µg), dha (mg), caffeine (mg)';
+  const SYS_MEAL = `You are a registered dietitian estimating nutrition from ONE meal photo for a pregnant user.
+Identify each distinct food or drink, estimate its portion in grams (use plates ~26 cm, chopsticks ~24 cm, bowls ~12 cm, cups ~240 ml as scale references), then compute energy, macronutrients AND the pregnancy-relevant micronutrients ${MICRO} FOR THAT PORTION using standard food composition data (USDA FoodData Central / 中国食物成分表). Caffeine matters: coffee, tea, cola, milk tea, chocolate, energy drinks must carry a realistic caffeine value; everything else 0. Supplements or non-food: skip. If unsure, still give a best estimate and mark confidence "low".
+Return ONLY JSON:
+{"items":[{"name":"short name in the answer language","grams":0,"kcal":0,"protein":0,"carb":0,"fat":0,"fibre":0,"folate":0,"iron":0,"calcium":0,"iodine":0,"dha":0,"caffeine":0,"confidence":"high"|"medium"|"low"}],"notes":"one or two short sentences: assumptions, pregnancy-relevant cautions (raw fish, soft cheese, high caffeine, very high sugar…), or empty"}
+All numeric values are totals for the estimated portion (not per 100 g). grams/kcal integers, others one decimal. If nothing edible is visible return {"items":[],"notes":"..."}.`;
 
-  // --- Food photo analysis --------------------------------------------------------
-  function parseJSONLoose(raw) {
-    let s = String(raw).trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();
+  const SYS_IMPORT = `You convert images of diet and exercise records (screenshots from other apps, handwritten diaries, smartwatch summaries, food photos with captions) into structured entries for a pregnancy tracker.
+Extract every meal and every workout you can read. Dates: use the date shown; resolve relative words (今天/昨天/yesterday/Mon) against the provided "Today"; if the year is missing assume the most recent past occurrence. Never output future dates. Map meal slots to breakfast/lunch/dinner/snack by label or time (05–10 breakfast, 10:30–14 lunch, 17–21 dinner, else snack). Estimate grams, energy, macronutrients and the micronutrients ${MICRO} for the portion when not stated (standard composition tables; caffeine for coffee/tea/cola/milk tea). Map workouts to one of: ${WORKOUT_TYPES.join(', ')} (walk covers walking/hiking/stroller; strength covers light weights/resistance bands; other for anything else). minutes integer.
+Return ONLY JSON:
+{"meals":[{"date":"YYYY-MM-DD","meal":"breakfast"|"lunch"|"dinner"|"snack","name":"","grams":0,"kcal":0,"protein":0,"carb":0,"fat":0,"fibre":0,"folate":0,"iron":0,"calcium":0,"iodine":0,"dha":0,"caffeine":0}],"workouts":[{"date":"YYYY-MM-DD","type":"walk","minutes":0,"note":""}],"notes":"short remark or empty"}
+If nothing importable is visible return empty arrays.`;
+
+  // --- JSON extraction -----------------------------------------------------------------
+  function parseJSON(text) {
+    if (!text) throw new AIError('parse');
+    let s = String(text).trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+    try { return JSON.parse(s); } catch (e) { /* fall through */ }
     const a = s.indexOf('{'), b = s.lastIndexOf('}');
-    if (a >= 0 && b > a) s = s.slice(a, b + 1);
-    return JSON.parse(s);
+    if (a >= 0 && b > a) { try { return JSON.parse(s.slice(a, b + 1)); } catch (e) { /* fall through */ } }
+    throw new AIError('parse');
   }
-  async function analyzeFood(dataUrl) {
-    const prompt = [
-      'You are a nutrition vision assistant for a pregnancy tracking app.',
-      'Identify every distinct food or dish visible in the photo. Ignore packaging text claims; estimate from visual portion size.',
-      'For each item output: name (common name, 中文优先，otherwise English), grams (estimated edible portion), and kcal / protein / carb / fat / fiber for THAT portion, using standard tables (USDA / 中国食物成分表).',
-      'Be conservative with cooking oil and sauces; include drinks; split mixed dishes into components when possible.',
-      'Respond with ONLY minified JSON, no markdown, no commentary: {"items":[{"name":"米饭","grams":150,"kcal":174,"protein":3.9,"carb":38.9,"fat":0.5,"fiber":0.5}]}',
-    ].join('\n');
-    const raw = await chat([
-      { role: 'system', content: prompt },
-      { role: 'user', content: [{ type: 'text', text: '分析这张餐食照片' }, { type: 'image_url', image_url: { url: dataUrl, detail: 'auto' } }] },
-    ], { temperature: 0.2 });
-    const data = parseJSONLoose(raw);
-    const items = (data && (data.items || data.foods || data.result)) || [];
-    return (Array.isArray(items) ? items : [])
-      .filter(it => it && typeof it === 'object' && it.name)
-      .slice(0, 12)
-      .map(it => ({
-        name: String(it.name).slice(0, 40),
-        grams: clamp(+it.grams || 0, 1, 2000),
-        kcal: clamp(+it.kcal || 0, 0, 3500),
-        protein: clamp(+it.protein || 0, 0, 400),
-        carb: clamp(+it.carb || 0, 0, 700),
-        fat: clamp(+it.fat || 0, 0, 350),
-        fiber: clamp(+it.fiber || 0, 0, 150),
-      }))
-      .filter(it => it.grams > 0);
+  const num = (v, d = 0) => { const n = typeof v === 'string' ? parseFloat(v.replace(/[^\d.\-]/g, '')) : +v; return isFinite(n) ? n : d; };
+  const r1 = n => Math.round(n * 10) / 10;
+
+  // --- Transport -----------------------------------------------------------------------
+  const TIMEOUT_MS = 60000;
+  // Combine the caller's AbortSignal with a hard timeout. Returns {signal, done}.
+  function withTimeout(signal, ms = TIMEOUT_MS) {
+    const ctrl = new AbortController();
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; ctrl.abort(); }, ms);
+    const onAbort = () => ctrl.abort();
+    if (signal) { if (signal.aborted) ctrl.abort(); else signal.addEventListener('abort', onAbort, { once: true }); }
+    return { signal: ctrl.signal, done() { clearTimeout(timer); if (signal) signal.removeEventListener('abort', onAbort); }, get timedOut() { return timedOut; } };
   }
-  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-
-  // --- Offline pregnancy knowledge base ---------------------------------------------
-  // Compiled from public guidance (ACOG / NHS / WHO / 中国 DRIs). Keyword-scored.
-  const KB = [
-    {
-      keys: ['化妆', '护肤', '面膜', '精华', '防晒', 'skincare', 'cosmetic', 'makeup', 'sunscreen', 'retinol', '视黄醇', '维a酸', 'a酸', 'tretinoin', 'adapalene', '水杨酸', 'salicylic', '氢醌', '对苯二酚', 'hydroquinone', '染发', '烫发', 'hair', '美甲', 'nail', '精油', 'essential oil', '美白', 'whitening', '气垫', '口红'],
-      src: 'ACOG · NHS',
-      zh: '孕期护肤化妆总原则：**基础清洁、保湿、防晒可以照常**。需要避开或暂停的：\n• 维A酸类（视黄醇 retinol、A醇/A酸、adapalene）——口服维A酸明确致畸，外用吸收虽少，稳妥起见整个孕期停用，换成维C、烟酰胺等成分；\n• 高浓度水杨酸（大面积刷酸/化学换肤）避免；洗护产品里低浓度残留偶用问题不大；\n• 氢醌（美白祛斑）、含甲醛或邻苯类的三无产品避免；\n• 大面积涂抹不明成分精油（部分精油高剂量可能刺激子宫）不建议；香薰少量闻味可以。\n染发烫发：正规产品经头皮吸收很少，但一般建议孕 12 周后再做，或选挑染（少接触头皮）并保持通风。美甲偶尔做可以，选通风环境、避开含甲醛树脂的产品。\n妊娠期长斑、湿疹等问题请先问皮肤科再用药。把产品成分表拍给小芽AI（连接大模型后可识别图片）可以帮你逐个成分看。',
-      en: 'General rule: **cleansing, moisturiser and sunscreen are fine to continue**. Pause or avoid:\n• Vitamin A derivatives (retinol, tretinoin, adapalene) — oral isotretinoin is clearly teratogenic; topical absorption is minimal but the cautious standard advice is to stop for the whole pregnancy; use vitamin C or niacinamide instead;\n• High-strength salicylic acid peels; low concentrations in rinse-off products used occasionally are not a concern;\n• Hydroquinone and unregulated products with formaldehyde or phthalates;\n• Applying unknown essential oils over large body areas.\nHair dye: systemic absorption from regulated dyes is tiny, but many services suggest waiting until after week 12 or using highlights (little scalp contact) in a ventilated space. Manicures are fine occasionally in a well-ventilated salon.\nFor melasma or pregnancy eczema, see a dermatologist before starting any prescription. Photograph the ingredient list and send it to Sprout AI (with an LLM connected) for a per-ingredient review.',
-    },
-    {
-      keys: ['咖啡', 'coffee', '奶茶', '茶', 'tea', '可乐', 'cola', '能量饮料', 'energy drink', '咖啡因', 'caffeine', '拿铁', '美式'],
-      src: 'ACOG · NHS',
-      zh: '咖啡因可以喝，**每天 ≤200 mg**：约一杯 350 ml 滴滤咖啡，或 2 小杯茶。奶茶咖啡因不低、糖更高，算进总量；能量饮料常超量且含其他刺激物，建议整个孕期避免。孕期代谢咖啡因变慢，过量与低出生体重、流产风险相关。本 App「饮食」页会自动累计你记录饮品的咖啡因并给上限提醒。',
-      en: 'Yes, with **≤200 mg caffeine a day**: about one 350 ml (12 oz) drip coffee or two small cups of tea. Count milk tea (caffeine and sugar) in your total; energy drinks are usually over the limit and contain other stimulants — avoid them entirely. Caffeine is cleared more slowly in pregnancy, and high intake is associated with low birth weight.',
-    },
-    {
-      keys: ['酒', '酒精', 'alcohol', 'wine', 'beer', '啤酒', '红酒', '米酒', '醪糟', '料酒', '鸡尾酒'],
-      src: 'ACOG · WHO · NHS',
-      zh: '孕期**没有已知的安全饮酒剂量**。酒精能直接通过胎盘，与胎儿酒精谱系障碍（生长受限、面部异常、神经发育障碍）相关，孕早期影响最大。建议整个孕期完全避免：含料酒的菜尽量久煮让酒精挥发或改用无料酒；醪糟、酒心巧克力也算。备孕期间也建议戒。',
-      en: 'There is **no known safe amount of alcohol** in pregnancy. Alcohol crosses the placenta and causes fetal alcohol spectrum disorders; risk is highest early on. Avoid completely, including dishes cooked with rice wine (or simmer long enough to evaporate), drunk-fruit desserts and liqueur chocolates. Also advisable while trying to conceive.',
-    },
-    {
-      keys: ['生鱼片', '刺身', '寿司', 'sushi', 'sashimi', '生腌', '醉蟹', '醉虾', '溏心', '半熟', '生蛋', 'raw', '生蚝', 'oyster', '冷切', 'deli', '火腿', '培根', 'cheese', '奶酪', 'brie', 'camembert', '蓝纹', '未消毒', 'unpasteurised', '生牛乳', '生豆芽', 'sprout'],
-      src: 'NHS · FDA',
-      zh: '孕期免疫有变化，李斯特菌/沙门氏菌/弓形虫感染后果更重，所以对「生的」要更严格。**避免**：生鱼寿司与刺身、生腌醉蟹醉虾、溏心蛋与未全熟的肉（涮肉要全熟）、冷藏即食冷切肉和热狗（除非重新加热到冒热气）、未消毒鲜奶及用其做的软奶酪（brie/camembert/蓝纹——看标签“巴氏杀菌/pasteurised”）、生豆芽。\n**可以**：全熟海鲜和蛋、巴氏杀菌奶与酸奶、硬质奶酪、室温可达标的熟食。想吃寿司就点熟料卷（鳗鱼、熟虾、蔬菜卷、玉子烧）。',
-      en: 'Pregnancy shifts your immunity, so Listeria/Salmonella/Toxoplasma hit harder. **Avoid**: raw-fish sushi and sashimi, raw-marinated crab/shrimp, runny eggs and undercooked meat, cold deli meats and hot dogs unless reheated until steaming, unpasteurised milk and soft cheeses made from it (brie, camembert, blue — check for “pasteurised”), raw sprouts.\n**Fine**: fully cooked seafood and eggs, pasteurised dairy and yogurt, hard cheeses, hot freshly-cooked food. For sushi, choose cooked rolls (eel, cooked shrimp, veg, tamago).',
-    },
-    {
-      keys: ['鱼', 'fish', '三文鱼', 'salmon', '金枪鱼', 'tuna', '汞', 'mercury', 'dha', '海鲜', 'seafood', '虾', '蟹', 'crab', '鳕鱼', '带鱼'],
-      src: 'FDA/EPA · ACOG',
-      zh: '鱼类是 DHA 与优质蛋白的关键来源，**每周 2–3 次低汞鱼**（三文鱼、沙丁鱼、鳕鱼、带鱼）是被推荐的主角。**避免高汞鱼**：鲨鱼、剑鱼、大眼金枪鱼、方头鱼（鲭鱼王）；淡金枪鱼罐头每周 ≤2–3 份，长鳍金枪鱼 ≤1 份。蟹和虾必须彻底熟透——熟透可以适量吃，生腌醉蟹绝对不行；贝类（生蚝等）务必全熟。',
-      en: 'Fish is the key DHA source: **2–3 servings of low-mercury fish weekly** (salmon, sardines, cod) is recommended. **Avoid high-mercury fish**: shark, swordfish, bigeye tuna, tilefish, king mackerel; light tuna ≤2–3 servings/week, albacore ≤1. Crab and shrimp are fine fully cooked — never raw-marinated; shellfish must be cooked through.',
-    },
-    {
-      keys: ['肝', 'liver', '维生素a', 'vitamin a', '鱼肝油', '猪肝', '鹅肝'],
-      src: '中国 DRIs · NHS',
-      zh: '动物肝脏补铁效果好，但**孕期维生素A过量有致畸风险**。建议：每周 1–2 次、每次 ≤30–50 g 猪肝/鸭肝；不要同时叠加鱼肝油或高剂量维生素A补充剂（复合维生素按推荐量吃即可）。植物来源的β-胡萝卜素（橙黄色蔬果）没有过量风险。',
-      en: 'Liver is iron-rich, but **excess preformed vitamin A is teratogenic**. Keep to 1–2 servings a week, ≤30–50 g each; do not stack cod-liver oil or high-dose vitamin A supplements on top (a standard prenatal is fine). Beta-carotene from fruit and vegetables carries no such risk.',
-    },
-    {
-      keys: ['运动', 'exercise', '跑步', 'yoga', '瑜伽', '游泳', 'swim', '健身', 'walk', '快走', '深蹲', '锻炼', '普拉提', 'pilates', '骑行', '慢跑'],
-      src: 'ACOG · 中国孕期运动专家共识 2019',
-      zh: '无禁忌证时**推荐每周 ≥150 分钟中等强度运动**（快走、游泳、固定单车、孕妇瑜伽、轻力量训练），能降低妊娠期糖尿病、子痫前期和过度增重的风险，也不会增加早产。强度用“谈话测试”：能完整说话、不能唱歌。**避免**：孕中晚期仰卧超过 2–3 分钟、有跌倒/撞击风险的项目（滑雪、骑马、对抗球类）、高温瑜伽、潜水。\n出现出血、破水、规律宫缩、头晕、胸痛、小腿痛肿立即停止就医。首次使用请先完成 App「运动」里的安全筛查。',
-      en: 'Without contraindications, **≥150 min/week of moderate activity** (brisk walking, swimming, stationary cycling, prenatal yoga, light strength) lowers the risk of GDM, pre-eclampsia and excess gain, and does not raise preterm birth risk. Intensity: talk test — can talk, cannot sing. **Avoid** after mid-pregnancy: >2–3 min flat on your back, fall/contact sports, hot yoga, diving.\nStop and seek care for bleeding, fluid loss, regular contractions, dizziness, chest pain or calf pain/swelling. Complete the in-app exercise safety screen first.',
-    },
-    {
-      keys: ['药', 'medication', '感冒', '发烧', '止痛', '布洛芬', 'ibuprofen', '对乙酰氨基酚', '扑热息痛', 'paracetamol', 'acetaminophen', '抗生素', '吃药', '异维a'],
-      src: 'ACOG · NHS · UKTIS',
-      zh: '总原则：**不要硬扛，也不要自行乱吃药**——先告诉医生/药师你怀孕及孕周。参考信息：对乙酰氨基酚（扑热息痛）是孕期退热镇痛的首选；布洛芬等 NSAID 孕 28 周后禁用，孕早中期也需医生评估；治疗痘痘的异维A酸明确致畸，备孕起就停；青霉素类、头孢类等常见抗生素在有必要时可以安全使用，但需医生开具。慢性病药（甲功、降压、抗抑郁等）不要自行停，复诊时让医生调整。',
-      en: 'Golden rule: **don\'t just push through, and don\'t self-medicate** — tell any prescriber you are pregnant and the gestational week. General information: paracetamol/acetaminophen is the first-choice analgesic; NSAIDs like ibuprofen are avoided after 28 weeks and need clinician input earlier; isotretinoin (acne) is clearly teratogenic — stop before conceiving; common antibiotics (penicillins, cephalosporins) are safe when genuinely needed but must be prescribed. Never stop chronic-disease medication on your own — have your clinician adjust it.',
-    },
-    {
-      keys: ['疫苗', 'vaccine', '流感疫苗', 'flu', '百日咳', 'tdap', '新冠', 'covid', '破伤风'],
-      src: 'ACOG · WHO · NHS',
-      zh: '孕期**推荐**接种：灭活流感疫苗（任何孕周）；Tdap 百日咳疫苗（孕 27–36 周，把抗体传给宝宝）；新冠疫苗（各主要指南均推荐）。**避免**活疫苗（麻腮风、水痘等）——放到孕前或产后。破伤风、乙肝等灭活疫苗按需可接种。接种前告知孕周即可。',
-      en: '**Recommended in pregnancy**: inactivated flu vaccine (any trimester), Tdap at 27–36 weeks (passes antibodies to baby), and COVID-19 vaccines per major guidelines. **Avoid live vaccines** (MMR, varicella) until after birth. Tetanus and hepatitis B (inactivated) may be given when indicated. Just tell the vaccinator your gestational week.',
-    },
-    {
-      keys: ['猫', 'cat', '猫砂', '弓形虫', 'toxoplasma', '宠物', '狗', 'dog'],
-      src: 'NHS · CDC',
-      zh: '宠物可以继续养。猫的风险来自弓形虫：尽量**不亲手换猫砂**（必须换时戴手套并彻底洗手）；虫卵需要 1–5 天才有传染性，所以每天清理最安全；不让猫外出捕食、不喂生肉；园艺也戴手套。狗没有弓形虫的这一风险。孕前/孕早期可以查弓形虫抗体了解自己的免疫状态。',
-      en: 'Keep your pets. For cats the concern is toxoplasmosis: avoid changing litter (wear gloves and wash hands if you must); oocysts need 1–5 days to become infectious, so daily litter changes are safest; keep cats indoors and don\'t feed raw meat; wear gloves for gardening. Dogs carry no such risk. Antibody testing before or in early pregnancy can show if you are already immune.',
-    },
-    {
-      keys: ['温泉', '桑拿', 'sauna', '泡澡', 'hot tub', '热水澡', '汗蒸', '泡脚', '高烧', '发热'],
-      src: 'ACOG · NHS',
-      zh: '孕早期（尤其 3–12 周）核心体温持续超过 39 ℃ 与神经管缺陷风险升高相关。**避免**：桑拿、蒸汽房、温泉池、39 ℃ 以上热水泡浴久泡。**可以**：温水淋浴；≤38 ℃ 的短时间泡脚一般没问题。发烧本身要积极处理：物理降温 + 对乙酰氨基酚，持续 >38.5 ℃ 及时就医。',
-      en: 'Sustained core temperature above 39 °C in the first trimester is linked to higher neural-tube-defect risk. **Avoid**: saunas, steam rooms, hot tubs and long very-hot baths. **Fine**: warm showers; brief foot soaks up to ~38 °C. Treat fever promptly (cooling + paracetamol) and seek care above 38.5 °C.',
-    },
-    {
-      keys: ['孕吐', '恶心', '呕吐', 'morning sickness', 'nausea', '反胃', '干呕', '害喜'],
-      src: 'ACOG · 中国孕产期膳食指南',
-      zh: '约七八成孕妇有孕吐，多在 12–16 周明显缓解。**缓解方法**：少量多餐不空腹；起床前先吃几口干粮（苏打饼干）；姜（姜茶/姜糖）；避油腻和气味重的食物；冷食常比热食容易接受；维生素 B6 对部分人有效（剂量请医生确认）。\n**警示信号**：完全无法进食进水、尿量明显减少、体重下降超过孕前 5%、呕血或咖啡样物——可能是妊娠剧吐，需要就医补液和药物。',
-      en: 'Nausea affects ~70–80% of pregnancies and usually eases by 12–16 weeks. **What helps**: small frequent meals, never empty; dry crackers before getting up; ginger; avoiding greasy/strong-smelling food; cold foods often go down easier; vitamin B6 helps some (dose via your clinician).\n**Red flags**: cannot keep food or fluids down, much less urine, >5% pre-pregnancy weight loss, blood in vomit — that is hyperemesis and needs medical care.',
-    },
-    {
-      keys: ['便秘', 'constipation', '纤维', 'fibre', 'fiber', '排便', '痔疮'],
-      src: '中国 DRIs · NHS',
-      zh: '孕期便秘很常见（孕激素减慢肠蠕动，铁剂也加重）。**改善**：每天膳食纤维 25–30 g（全谷物、豆类、火龙果、西梅、猕猴桃）、饮水 1.5–2 L、每天快走 30 分钟、固定排便时间；本 App「饮食」页现在会统计你的膳食纤维完成度。仍无效可与医生讨论乳果糖等孕期可用缓泻剂，避免自行用刺激性泻药。痔疮：温水坐浴、别久蹲久站。',
-      en: 'Constipation is common (progesterone slows the gut; iron makes it worse). **What helps**: 25–30 g fibre daily (whole grains, legumes, kiwi, prunes, dragon fruit), 1.5–2 L water, 30 min brisk walking, a regular toilet routine — the Diet tab now tracks your fibre. If that fails, ask your clinician about pregnancy-safe laxatives like lactulose; avoid stimulant laxatives self-prescribed. Haemorrhoids: warm sitz baths, avoid straining.',
-    },
-    {
-      keys: ['失眠', '睡不着', 'sleep', 'insomnia', '睡眠', '多梦'],
-      src: 'ACOG · NHS',
-      zh: '孕中晚期失眠非常常见。**建议**：固定作息与起床时间；睡前 2 小时不大量进食；午睡 ≤30 分钟；左侧卧 + 孕妇枕/抱枕支撑腰腹；白天足量饮水、晚饭后限水；下午停咖啡因；睡前放下手机。长期严重失眠可与医生讨论安全干预，不建议自行服褪黑素类助眠产品。',
-      en: 'Insomnia in the 2nd/3rd trimester is very common. **Helps**: fixed sleep/wake times; no big meals within 2 h of bed; naps ≤30 min; left-side lying with pillows supporting bump and back; drink well during the day, taper after dinner; no afternoon caffeine; screens off. For persistent insomnia speak to your clinician; self-prescribed melatonin-type products aren\'t advised.',
-    },
-    {
-      keys: ['胎动', 'kicks', '动得少', 'fetal movement', '胎动少'],
-      src: 'ACOG · 中国围产指南',
-      zh: '孕 28 周起每天固定时间数胎动（左侧卧或静坐）：**2 小时内 ≥10 次**为 reassuring。**明显减少或 2 小时 <10 次——立即联系产科/急诊，不要等到明天**。孕晚期变化的是幅度和节奏而不是消失；每个宝宝有自己的活跃时段，重点是“和平时比有没有明显不同”。',
-      en: 'From 28 weeks, count movements at a fixed daily time (left-side or seated): **≥10 within 2 hours** is reassuring. **Markedly reduced, or <10 in 2 hours — contact your maternity unit or emergency now, do not wait until tomorrow.** Late in pregnancy the *pattern* changes, not the presence; what matters is a clear change from your baby\'s usual.',
-    },
-    {
-      keys: ['出血', '流血', 'bleeding', '破水', '羊水', 'water broke', '剧烈腹痛', '腹痛', '抽搐', 'seizure', '视物模糊', '剧烈头痛', 'severe headache', '宫缩', 'contraction'],
-      src: 'ACOG · WHO',
-      zh: '以下情况**请立即就医，不要等、不要先问AI**：阴道出血或流液（可能破水）；持续剧烈腹痛；未足月出现规律宫缩；剧烈头痛伴视物模糊、上腹痛或全身水肿加重；抽搐；胎动明显减少；发热 >38 ℃ 伴寒战；摔倒或腹部受撞击后。安全永远排在第一位。',
-      en: 'Seek care **immediately — before asking any AI**: vaginal bleeding or fluid loss (possibly waters), persistent severe abdominal pain, regular contractions before term, severe headache with blurred vision or upper abdominal pain, seizures, clearly reduced movements, fever >38 °C with chills, or any fall/impact to the abdomen. Safety comes before anything else.',
-    },
-    {
-      keys: ['甜味剂', '代糖', 'aspartame', '阿斯巴甜', '无糖', '零度', '赤藓糖醇', '木糖醇', '三氯蔗糖', 'sweetener'],
-      src: 'FDA · EFSA · NHS',
-      zh: '常见许可甜味剂（阿斯巴甜、三氯蔗糖、安赛蜜、甜菊糖苷）在许可用量内孕期是安全的；**阿斯巴甜例外人群：苯丙酮尿症（PKU）**。无糖饮料可以喝，但别替代水；赤藓糖醇大量摄入的长期证据还在累积，适量即可。最推荐的还是白水、淡柠檬水、无糖气泡水。',
-      en: 'Permitted sweeteners (aspartame, sucralose, acesulfame-K, stevia) are safe at permitted intakes; **aspartame must be avoided only with PKU**. Diet drinks are fine but shouldn\'t replace water; evidence on large amounts of erythritol is still maturing, so moderation. Best choices remain water, sparkling water, water with lemon.',
-    },
-    {
-      keys: ['中药', '草药', 'herbal', '花茶', '凉茶', '当归', '益母草', '藏红花', '补品', '燕窝', '阿胶', '海参', '人参'],
-      src: 'NHS · 中国孕产期膳食指南',
-      zh: '成分不明的草本茶、中药方和动物源补品（燕窝、阿胶“补气血”证据有限）**不建议孕期常规使用**——不少草药有活血或成分不明的问题。确有需要（感冒调理等）请到正规中医机构并主动告知孕周。有明确证据的是：叶酸、铁、钙、碘、DHA 按 App 内目标补足，比昂贵的补品更重要。',
-      en: 'Herbal teas, traditional formulas and animal-derived tonics of unclear composition (bird\'s nest, donkey-hide gelatin — limited evidence) are **not recommended routinely in pregnancy**; some herbs are uterotonic or simply unstandardised. If you genuinely need one, see a licensed practitioner and tell them your gestational week. The evidence-backed “supplements” are folate, iron, calcium, iodine and DHA at your in-app targets.',
-    },
-  ];
-
-  function trafficHit(q) {
-    const ql = q.toLowerCase();
-    const variant = Standards.region(Store.state.settings.region).dietVariant;
-    const lists = [['go', 'd.tl.go', Content.TRAFFIC.go], ['mod', 'd.tl.mod', Content.TRAFFIC.mod[variant]], ['stop', 'd.tl.stop', Content.TRAFFIC.stop[variant]]];
-    for (const [key, labelKey, arr] of lists) {
-      for (const it of arr) {
-        if ((it.zh && q.includes(it.zh)) || (it.en && ql.includes(String(it.en).toLowerCase()))) {
-          return { key, labelKey, item: it };
+  function fetchError(e, tm) {
+    if (e && e.name === 'AbortError') return new AIError(tm && tm.timedOut ? 'timeout' : 'aborted');
+    // A TypeError from fetch while the browser says it is online is almost always CORS / blocked endpoint.
+    const online = typeof navigator === 'undefined' || navigator.onLine !== false;
+    if (online && cfg().provider === 'openai') return new AIError('cors', e && e.message);
+    return new AIError('network', e && e.message);
+  }
+  async function readError(res) {
+    const txt = await res.text().catch(() => '');
+    let body = null; try { body = txt ? JSON.parse(txt) : null; } catch (e) { body = null; }
+    const msg = (body && body.error && (body.error.message || body.error.code)) || txt.slice(0, 200) || res.statusText;
+    if (res.status === 401 || res.status === 403) return new AIError('key', msg);
+    if (res.status === 429) return new AIError('quota', msg);
+    if (res.status === 404 || (/model/i.test(String(msg)) && res.status === 400)) return new AIError('model', msg);
+    if (res.status === 400 && /API key|api_key/i.test(String(msg))) return new AIError('key', msg);
+    return new AIError('generic', `${res.status} ${msg}`);
+  }
+  async function httpJSON(url, opts = {}) {
+    const tm = withTimeout(opts.signal);
+    let res;
+    try { res = await fetch(url, Object.assign({}, opts, { signal: tm.signal })); }
+    catch (e) { tm.done(); throw fetchError(e, tm); }
+    try {
+      if (!res.ok) throw await readError(res);
+      const txt = await res.text();
+      try { return txt ? JSON.parse(txt) : null; } catch (e) { throw new AIError('parse'); }
+    } finally { tm.done(); }
+  }
+  // POST and consume a server-sent-event stream; onEvent(jsonChunk) per "data:" line. Falls back to a plain JSON body.
+  async function httpSSE(url, opts, onEvent) {
+    const tm = withTimeout(opts.signal, TIMEOUT_MS * 2);
+    let res;
+    try { res = await fetch(url, Object.assign({}, opts, { signal: tm.signal })); }
+    catch (e) { tm.done(); throw fetchError(e, tm); }
+    try {
+      if (!res.ok) throw await readError(res);
+      const ct = res.headers.get('content-type') || '';
+      if (!res.body || !res.body.getReader || !/event-stream/i.test(ct)) {
+        const txt = await res.text(); let j = null; try { j = JSON.parse(txt); } catch (e) { throw new AIError('parse'); }
+        onEvent(j); return;
+      }
+      const reader = res.body.getReader(), dec = new TextDecoder();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).replace(/\r$/, ''); buf = buf.slice(i + 1);
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          try { onEvent(JSON.parse(data)); } catch (e) { /* ignore partial */ }
         }
       }
-    }
-    return null;
+      if (buf.startsWith('data:')) { const data = buf.slice(5).trim(); if (data && data !== '[DONE]') { try { onEvent(JSON.parse(data)); } catch (e) { /* ignore */ } } }
+    } catch (e) {
+      if (e instanceof AIError) throw e;
+      throw fetchError(e, tm);
+    } finally { tm.done(); }
+  }
+  function baseUrl() { const a = cfg(); return (a.baseUrl || OPENAI_BASE).replace(/\/+$/, ''); }
+
+  // req = { system, text, images:[dataURL], audio:{dataURL}|null, history:[{role:'user'|'ai', text}], signal?, onDelta?(textSoFar) }
+  async function callGemini(req) {
+    const a = cfg();
+    const model = a.model || 'gemini-2.5-flash';
+    const contents = [];
+    for (const h of (req.history || [])) if (h.text) contents.push({ role: h.role === 'ai' ? 'model' : 'user', parts: [{ text: h.text }] });
+    const parts = [];
+    for (const im of (req.images || [])) { const { mime, b64 } = splitDataURL(im); parts.push({ inline_data: { mime_type: mime, data: b64 } }); }
+    if (req.audio) { const { mime, b64 } = splitDataURL(req.audio.dataURL); parts.push({ inline_data: { mime_type: req.audio.mime || mime, data: b64 } }); }
+    parts.push({ text: req.text || '(see attachment)' });
+    contents.push({ role: 'user', parts });
+    const body = {
+      system_instruction: { parts: [{ text: req.system }] },
+      contents,
+      generationConfig: { temperature: 0.3, response_mime_type: 'application/json', max_output_tokens: 2048 },
+      safetySettings: ['HARM_CATEGORY_HARASSMENT', 'HARM_CATEGORY_HATE_SPEECH', 'HARM_CATEGORY_SEXUALLY_EXPLICIT', 'HARM_CATEGORY_DANGEROUS_CONTENT'].map(c => ({ category: c, threshold: 'BLOCK_ONLY_HIGH' })),
+    };
+    const opts = { method: 'POST', headers: { 'Content-Type': 'application/json', 'x-goog-api-key': a.apiKey }, body: JSON.stringify(body), signal: req.signal };
+    let text = '', blocked = null;
+    const take = out => {
+      if (out && out.promptFeedback && out.promptFeedback.blockReason) blocked = out.promptFeedback.blockReason;
+      const cand = out && out.candidates && out.candidates[0];
+      if (!cand) return;
+      if (cand.finishReason === 'SAFETY' || cand.finishReason === 'PROHIBITED_CONTENT') blocked = cand.finishReason;
+      text += (cand.content && cand.content.parts || []).map(p => p.text || '').join('');
+      if (req.onDelta) req.onDelta(text);
+    };
+    if (req.onDelta) await httpSSE(`${GEMINI_BASE}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`, opts, take);
+    else take(await httpJSON(`${GEMINI_BASE}/models/${encodeURIComponent(model)}:generateContent`, opts));
+    if (blocked) throw new AIError('blocked', blocked);
+    if (!text) throw new AIError('parse');
+    return text;
   }
 
-  // Score topics by keyword hits; answer with the best match.
-  function offlineAnswer(question) {
-    const q = String(question || '').trim();
-    const ql = q.toLowerCase();
-    let best = null, bestScore = 0;
-    for (const topic of KB) {
-      let s = 0;
-      for (const k of topic.keys) if (ql.includes(k.toLowerCase())) s += k.length >= 3 ? 2 : 1;
-      if (s > bestScore) { bestScore = s; best = topic; }
+  async function callOpenAI(req) {
+    const a = cfg();
+    const model = a.model || 'gpt-4o-mini';
+    const messages = [{ role: 'system', content: req.system }];
+    for (const h of (req.history || [])) if (h.text) messages.push({ role: h.role === 'ai' ? 'assistant' : 'user', content: h.text });
+    const content = [];
+    for (const im of (req.images || [])) content.push({ type: 'image_url', image_url: { url: im } });
+    if (req.audio) {
+      const { b64 } = splitDataURL(req.audio.dataURL);
+      const fmt = /mp4|m4a|aac/.test(req.audio.mime || '') ? 'mp4' : /wav/.test(req.audio.mime || '') ? 'wav' : /mp3|mpeg/.test(req.audio.mime || '') ? 'mp3' : 'webm';
+      content.push({ type: 'input_audio', input_audio: { data: b64, format: fmt } });
     }
-    const hit = trafficHit(q);
-    let head = '';
-    if (hit) {
-      const verdict = t(hit.labelKey);
-      head = `📌 App 饮食红绿灯把「${hit.item.zh}」归为 *${verdict}*：${UI.L(hit.item.why)}。\n\n`;
-    }
-    if (best) {
-      const body = I18N.lang === 'zh' ? best.zh : best.en;
-      return { text: head + body, src: best.src, matched: true };
-    }
-    const generic = I18N.lang === 'zh'
-      ? '这个问题超出内置知识库的范围。孕期通用原则供参考：\n• 饮食：避免生食、酒精、高汞鱼、未消毒奶制品；保证叶酸/铁/钙/碘/DHA。\n• 运动：无禁忌证时保持每周 ≥150 分钟中等强度。\n• 用药与治疗：任何用药先告知医生你在孕期。\n• 急症信号：出血、破水、剧烈腹痛、胎动明显减少、剧烈头痛——立即就医。\n\n可以换个具体问法（如「孕妇能吃 X 吗」「X 成分护肤品能用吗」）；或在「我的 → AI 服务设置」接入你自己的大模型，获得不受词库限制的问答。'
-      : 'This is beyond the built-in knowledge base. General pregnancy principles: avoid raw food, alcohol, high-mercury fish and unpasteurised dairy; keep folate/iron/calcium/iodine/DHA on target; stay active (≥150 min/week) without contraindications; tell any prescriber you are pregnant; and seek immediate care for bleeding, fluid loss, severe pain, reduced movements or severe headache.\n\nTry a more specific question, or connect your own LLM under Me → AI service settings for open-ended answers.';
-    return { text: head + generic, src: 'ACOG · NHS · WHO', matched: false };
+    content.push({ type: 'text', text: req.text || '(see attachment)' });
+    messages.push({ role: 'user', content: content.length === 1 ? content[0].text : content });
+    const stream = !!req.onDelta;
+    const opts = { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + a.apiKey }, body: JSON.stringify({ model, messages, temperature: 0.3, max_tokens: 2048, stream }), signal: req.signal };
+    let text = '', filtered = false;
+    const take = out => {
+      const ch = out && out.choices && out.choices[0];
+      if (!ch) return;
+      if (ch.finish_reason === 'content_filter') filtered = true;
+      const c = ch.delta ? ch.delta.content : (ch.message && ch.message.content);
+      text += Array.isArray(c) ? c.map(p => p.text || '').join('') : (c || '');
+      if (req.onDelta) req.onDelta(text);
+    };
+    if (stream) await httpSSE(`${baseUrl()}/chat/completions`, opts, take);
+    else take(await httpJSON(`${baseUrl()}/chat/completions`, opts));
+    if (filtered) throw new AIError('blocked');
+    if (!text) throw new AIError('parse');
+    return text;
   }
 
-  global.AI = { configured, chat, chatWithHistory, test, analyzeFood, offlineAnswer, cfg };
+  async function call(req) {
+    const a = cfg();
+    if (!a.apiKey) throw new AIError('key');
+    if (!a.consent) throw new AIError('consent');
+    const text = a.provider === 'openai' ? await callOpenAI(req) : await callGemini(req);
+    return parseJSON(text);
+  }
+  // While a JSON answer streams in, surface the partial "answer" string so the UI can show progress.
+  function partialAnswer(text) {
+    const m = /"answer"\s*:\s*"/.exec(text || '');
+    if (!m) return '';
+    let s = text.slice(m.index + m[0].length), out = '';
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === '\\') { const n = s[i + 1]; if (n === 'n') out += '\n'; else if (n === 't') out += '\t'; else if (n === 'u') { out += String.fromCharCode(parseInt(s.slice(i + 2, i + 6), 16) || 32); i += 4; } else if (n != null) out += n; i++; }
+      else if (c === '"') break;
+      else out += c;
+    }
+    return out;
+  }
+
+  // --- Public tasks --------------------------------------------------------------------
+  function normAnswer(j, fallbackText) {
+    const v = ['yes', 'caution', 'no', 'info'].includes(j.verdict) ? j.verdict : 'info';
+    return {
+      verdict: v, title: String(j.title || '').trim(), text: String(j.answer || j.text || fallbackText || '').trim(),
+      tips: Array.isArray(j.tips) ? j.tips.map(String).filter(Boolean).slice(0, 4) : [],
+      sources: Array.isArray(j.sources) ? j.sources.map(String).filter(Boolean).slice(0, 4) : [],
+      seekCare: !!j.seekCare, transcript: String(j.transcript || '').trim(),
+    };
+  }
+  async function ask({ text = '', images = [], audio = null, history = [], signal = null, onDelta = null } = {}) {
+    if (cfg().demo) { await wait(700, signal); return demoAnswer(text, images, audio); }
+    const j = await call({ system: SYS_CHAT + '\n\n' + context(), text: text || (audio ? 'Please transcribe and answer my voice question.' : 'Please look at the photo and tell me whether it is suitable during pregnancy.'), images, audio, history: history.slice(-8), signal, onDelta: onDelta ? raw => onDelta(partialAnswer(raw)) : null });
+    return normAnswer(j);
+  }
+
+  // --- Nutrition helpers -------------------------------------------------------------------
+  const NUT_KEYS = ['kcal', 'protein', 'carb', 'fat', 'fibre', 'folate', 'iron', 'calcium', 'iodine', 'dha', 'caffeine'];
+  const MICRO_KEYS = ['folate', 'iron', 'calcium', 'iodine', 'dha', 'caffeine'];
+  const normName = s => String(s || '').toLowerCase().replace(/[\s\u3000·•,，。.、()（）\-_/+&]/g, '').replace(/（.*?）|\(.*?\)/g, '');
+  // Best-effort match of a free-text food name to the local database (exact, then containment of ≥2 chars).
+  function matchFood(name) {
+    const n = normName(name); if (!n) return null;
+    const foods = Content.FOODS.filter(f => !f.tags.includes('supplement'));
+    let hit = foods.find(f => normName(f.zh) === n || normName(f.en) === n);
+    if (hit) return hit;
+    const cands = foods.map(f => { const z = normName(f.zh), e = normName(f.en); const l = Math.max(z.length >= 2 && (n.includes(z) || z.includes(n)) ? z.length : 0, e.length >= 3 && (n.includes(e) || e.includes(n)) ? e.length : 0); return [l, f]; }).filter(x => x[0] > 0).sort((a, b) => b[0] - a[0]);
+    return cands.length ? cands[0][1] : null;
+  }
+  // Fill in micronutrients the model left out (0 / missing) from the matched database food, scaled by grams.
+  function fillMicros(n, name, grams) {
+    const f = matchFood(name);
+    if (!f) return { n, matched: null };
+    const db = Content.foodNutrients(f, grams);
+    const out = Object.assign({}, n);
+    for (const k of MICRO_KEYS) if (!(+out[k] > 0) && db[k] > 0) out[k] = r1(db[k]);
+    return { n: out, matched: f.id };
+  }
+  const round = (k, v) => k === 'kcal' ? Math.round(v) : r1(v);
+
+  function normItems(items) {
+    return (Array.isArray(items) ? items : []).map(it => {
+      const grams = Math.round(num(it.grams, 0));
+      const name = String(it.name || '').trim();
+      if (!name || grams <= 0) return null;
+      let n = {}; for (const k of NUT_KEYS) n[k] = Math.max(0, num(it[k]));
+      const filled = fillMicros(n, name, grams); n = filled.n;
+      // per-gram ratios so the UI can rescale when the user edits the portion
+      const per = {}; for (const k of NUT_KEYS) per[k] = n[k] / grams;
+      return { name, grams, per, matched: filled.matched, confidence: ['high', 'medium', 'low'].includes(it.confidence) ? it.confidence : 'medium' };
+    }).filter(Boolean).slice(0, 20);
+  }
+  const itemNutrients = (it, grams = it.grams) => { const out = {}; for (const k of NUT_KEYS) out[k] = round(k, (it.per[k] || 0) * grams); return out; };
+  async function analyzeMeal(image, { signal = null } = {}) {
+    if (cfg().demo) { await wait(1200, signal); return { items: normItems(DEMO_MEAL.items), notes: I18N.lang === 'zh' ? DEMO_MEAL.notes.zh : DEMO_MEAL.notes.en }; }
+    const j = await call({ system: SYS_MEAL + '\n\n' + context(), text: 'Analyse this meal photo.', images: [image], signal });
+    return { items: normItems(j.items), notes: String(j.notes || '').trim() };
+  }
+
+  function normImport(j) {
+    const today = Store.todayStr();
+    const okDate = d => /^\d{4}-\d{2}-\d{2}$/.test(d) && d <= today ? d : today;
+    const meals = (Array.isArray(j.meals) ? j.meals : []).map(m => {
+      const name = String(m.name || '').trim(); if (!name) return null;
+      const grams = Math.max(1, Math.round(num(m.grams, 100)));
+      let n = {}; for (const k of NUT_KEYS) n[k] = round(k, Math.max(0, num(m[k])));
+      n = fillMicros(n, name, grams).n;
+      return { date: okDate(String(m.date || '')), meal: MEALS.includes(m.meal) ? m.meal : 'snack', name, grams, n };
+    }).filter(Boolean).slice(0, 60);
+    const workouts = (Array.isArray(j.workouts) ? j.workouts : []).map(w => {
+      const minutes = Math.round(num(w.minutes)); if (!minutes || minutes <= 0) return null;
+      return { date: okDate(String(w.date || '')), type: WORKOUT_TYPES.includes(w.type) ? w.type : 'other', minutes: Math.min(600, minutes), note: String(w.note || '').trim() };
+    }).filter(Boolean).slice(0, 60);
+    return { meals, workouts, notes: String(j.notes || '').trim() };
+  }
+  async function importHistory(images, kind = 'both', { signal = null } = {}) {
+    if (cfg().demo) { await wait(1400, signal); return normImport(demoImport(kind)); }
+    const hint = kind === 'diet' ? 'The user says these are DIET records (still extract workouts if clearly present).' : kind === 'exercise' ? 'The user says these are EXERCISE records (still extract meals if clearly present).' : '';
+    const j = await call({ system: SYS_IMPORT + '\n\n' + context(), text: `Extract all records from the ${images.length} attached image(s). ${hint}`.trim(), images, signal });
+    return normImport(j);
+  }
+  // Cheap, stable fingerprint of an image data URL (used to flag re-importing the same screenshot).
+  function imageHash(dataURL) {
+    const s = String(dataURL || ''); let h = 5381;
+    for (let i = 0; i < s.length; i++) h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+    return (h >>> 0).toString(36) + s.length.toString(36);
+  }
+
+  async function listModels() {
+    const a = cfg();
+    if (!a.apiKey) throw new AIError('key');
+    if (a.provider === 'openai') {
+      const out = await httpJSON(`${baseUrl()}/models`, { headers: { Authorization: 'Bearer ' + a.apiKey } });
+      return ((out && out.data) || []).map(m => m.id).filter(Boolean).sort();
+    }
+    const out = await httpJSON(`${GEMINI_BASE}/models?pageSize=200`, { headers: { 'x-goog-api-key': a.apiKey } });
+    return ((out && out.models) || []).filter(m => (m.supportedGenerationMethods || []).includes('generateContent')).map(m => String(m.name || '').replace(/^models\//, '')).filter(n => /gemini/i.test(n)).sort();
+  }
+  async function test() {
+    const a = cfg();
+    if (!a.apiKey) throw new AIError('key');
+    const text = a.provider === 'openai'
+      ? await callOpenAI({ system: 'Reply with the JSON {"ok":true}.', text: 'ping' })
+      : await callGemini({ system: 'Reply with the JSON {"ok":true}.', text: 'ping' });
+    parseJSON(text);
+    return a.model || (a.provider === 'openai' ? 'gpt-4o-mini' : 'gemini-2.5-flash');
+  }
+
+  // Map an error to a user-facing message key.
+  function errorKey(e) {
+    const code = e && e.code;
+    if (code === 'key' || code === 'consent') return 'ai.err.key';
+    if (['quota', 'model', 'network', 'parse', 'blocked', 'image', 'timeout', 'aborted', 'cors'].includes(code)) return 'ai.err.' + code;
+    return 'ai.err.generic';
+  }
+
+  // --- Demo mode (offline samples) -------------------------------------------------------
+  // Demo delay that honours cancellation like a real request would.
+  const wait = (ms, signal) => new Promise((res, rej) => {
+    if (signal && signal.aborted) return rej(new AIError('aborted'));
+    const id = setTimeout(() => { if (signal) signal.removeEventListener('abort', onAbort); res(); }, ms);
+    const onAbort = () => { clearTimeout(id); rej(new AIError('aborted')); };
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  });
+  const DEMO_QA = [
+    { k: /螃蟹|蟹|crab/i, zh: { verdict: 'caution', title: '熟透的螃蟹可以适量吃', answer: '完全煮熟的螃蟹是优质蛋白来源，孕期可以吃。\n- 一定要蒸煮至全熟，避免醉蟹、生腌。\n- 每周水产总量建议 2–3 份（约 220–340 g），螃蟹属于低汞类。\n- 过敏体质或既往吃蟹不适者避免。\n- 「寒凉导致流产」缺乏科学依据。', tips: ['挑新鲜活蟹，现做现吃', '搭配姜醋更易消化', '肠胃敏感可先少量尝试'], sources: ['FDA/EPA Advice About Eating Fish 2021', 'NHS: Foods to avoid in pregnancy', '中国营养学会《孕期妇女膳食指南》2022'], seekCare: false },
+      en: { verdict: 'caution', title: 'Fully cooked crab is fine in moderation', answer: 'Thoroughly cooked crab is a good source of protein and low in mercury.\n- Avoid raw or lightly cured crab (e.g. drunken crab).\n- Aim for 2–3 servings (8–12 oz) of low-mercury seafood per week in total.\n- Skip it if you have a shellfish allergy.', tips: ['Buy fresh and eat it the same day', 'Reheat leftovers until steaming hot'], sources: ['FDA/EPA Advice About Eating Fish 2021', 'NHS: Foods to avoid in pregnancy'], seekCare: false } },
+    { k: /寿司|刺身|生鱼|sushi|sashimi|raw fish/i, zh: { verdict: 'caution', title: '熟食寿司可以，生鱼片建议避免', answer: '孕期主要担心李斯特菌、寄生虫和汞。\n- 熟料寿司（熟虾、鳗鱼、蟹柳、蔬菜卷）可以吃。\n- 生鱼片、生三文鱼卷不建议；若店家使用经商业急冻处理的鱼，风险较低但仍有争议。\n- 避免大型鱼：金枪鱼大腹、剑鱼、鲨鱼。', tips: ['选信誉好的餐厅', '用酱油别太多，注意钠'], sources: ['ACOG FAQ: Nutrition During Pregnancy 2023', 'NHS 2023'], seekCare: false },
+      en: { verdict: 'caution', title: 'Cooked sushi yes — raw fish best avoided', answer: 'Concerns are listeria, parasites and mercury.\n- Cooked rolls (shrimp tempura, eel, crab stick, veggie) are fine.\n- Skip raw fish and high-mercury species (bigeye tuna, swordfish).\n- UK guidance allows previously-frozen raw fish; US guidance advises avoiding it.', tips: ['Choose a reputable restaurant', 'Go easy on soy sauce (sodium)'], sources: ['ACOG FAQ 2023', 'NHS: Foods to avoid in pregnancy 2023'], seekCare: false } },
+    { k: /咖啡|奶茶|咖啡因|caffeine|coffee|tea/i, zh: { verdict: 'caution', title: '每天咖啡因不超过 200 mg', answer: '主流指南一致建议孕期咖啡因 ≤200 mg/天。\n- 约等于 1 杯中杯拿铁（≈150 mg）或 2 杯红茶。\n- 奶茶、可乐、巧克力、功能饮料里也有咖啡因，要一起算。\n- 应用的饮食页会自动累计今日咖啡因。', tips: ['换成低因咖啡或麦茶', '下午后尽量不喝，减少失眠'], sources: ['ACOG Committee Opinion 462', 'NHS 2023', 'WS/T 801-2022 配套指南'], seekCare: false },
+      en: { verdict: 'caution', title: 'Keep caffeine under 200 mg a day', answer: 'Guidelines agree on ≤200 mg/day in pregnancy.\n- That is about one 12-oz latte (~150 mg) or two cups of black tea.\n- Count cola, energy drinks, chocolate and bubble tea too.\n- The Diet tab tallies today\'s caffeine for you.', tips: ['Switch to decaf after lunch'], sources: ['ACOG Committee Opinion 462', 'NHS 2023'], seekCare: false } },
+    { k: /视黄醇|维A|维生素A|retin|tretinoin|异维|水杨酸|salicylic|护肤|化妆|面霜|精华|成分|skincare|cosmetic|cream|serum|ingredient/i, zh: { verdict: 'no', title: '含视黄醇 / 维 A 酸类产品孕期应避免', answer: '口服维 A 酸明确致畸；外用视黄醇吸收少，但各国指南仍建议孕期停用，以防万一。\n- **避免**：视黄醇、视黄醛、维 A 酸、异维 A 酸、他扎罗汀、高浓度水杨酸（>2%）、对苯二酚。\n- **可用**：烟酰胺、维生素 C、透明质酸、壬二酸、神经酰胺、物理防晒（氧化锌 / 二氧化钛）。\n- 孕期色斑与痘痘可咨询皮肤科选择安全方案。', tips: ['查看成分表（INCI）而不是只看产品名', '新产品先在耳后试用'], sources: ['ACOG FAQ: Skin Conditions During Pregnancy', 'AAD: Is any acne treatment safe during pregnancy?'], seekCare: false },
+      en: { verdict: 'no', title: 'Avoid retinol / retinoid products in pregnancy', answer: 'Oral retinoids are teratogenic; topical absorption is low, but guidelines still advise stopping them during pregnancy.\n- **Avoid**: retinol, retinal, tretinoin, isotretinoin, tazarotene, high-strength salicylic acid (>2%), hydroquinone.\n- **Fine**: niacinamide, vitamin C, hyaluronic acid, azelaic acid, ceramides, mineral sunscreen (zinc oxide / titanium dioxide).', tips: ['Read the INCI list, not just the front label', 'Patch-test new products'], sources: ['ACOG FAQ: Skin Conditions During Pregnancy', 'AAD guidance'], seekCare: false } },
+    { k: /染发|美甲|指甲油|烫发|hair dye|manicure|nail/i, zh: { verdict: 'caution', title: '染发、美甲可以，注意通风和时机', answer: '现有证据认为孕期染发和美甲风险很低。\n- 染发建议在 12 周后，选择半永久或挑染，减少头皮接触。\n- 美甲时保持通风，避免长时间吸入丙酮、甲醛等气味；可选「5-free」「10-free」指甲油。\n- 做完若头晕、恶心，及时离开到空气流通处。', tips: ['提前告知理发师 / 美甲师你怀孕了'], sources: ['NHS: Is it safe to use hair dye when pregnant?', 'ACOG FAQ 2023'], seekCare: false },
+      en: { verdict: 'caution', title: 'Hair dye and manicures are OK with ventilation', answer: 'Evidence suggests very low risk.\n- Many wait until after 12 weeks and choose highlights or semi-permanent dye to limit scalp contact.\n- Keep the room ventilated; choose "5-free"/"10-free" polishes.\n- Step outside if you feel light-headed.', tips: ['Tell your stylist you are pregnant'], sources: ['NHS: Is it safe to use hair dye when pregnant?', 'ACOG FAQ 2023'], seekCare: false } },
+    { k: /出血|见红|流血|破水|胎动减少|剧烈腹痛|bleed|leak|fluid|severe pain|no movement/i, zh: { verdict: 'info', title: '这些情况请立即联系医生', answer: '阴道出血、破水、胎动明显减少、持续剧烈腹痛、剧烈头痛或视物模糊都属于需要立刻就医的信号。请不要等待 AI 的解释，现在就联系产检医院或拨打急救电话。', tips: ['记录开始时间和量', '带好产检手册'], sources: ['ACOG: Warning signs during pregnancy', 'NHS: Urgent symptoms'], seekCare: true },
+      en: { verdict: 'info', title: 'Please contact your clinician now', answer: 'Vaginal bleeding, leaking fluid, noticeably reduced movements, persistent severe abdominal pain, severe headache or vision changes all need urgent assessment. Please call your maternity unit or emergency services now rather than waiting for an AI explanation.', tips: ['Note when it started', 'Bring your maternity notes'], sources: ['ACOG: Urgent maternal warning signs', 'NHS: Urgent symptoms'], seekCare: true } },
+  ];
+  const DEMO_DEFAULT = {
+    zh: { verdict: 'info', title: '演示模式示例回答', answer: '这是一条离线演示回答，用来展示小芽 AI 的回答格式：先给出结论，再列出要点与参考来源。\n- 连接你自己的 Gemini 或 OpenAI 兼容 Key 后，小芽会基于孕周、地区标准和你的问题给出真实回答。\n- 试试问「孕妇可以吃螃蟹吗」「含视黄醇的面霜能用吗」「每天能喝多少咖啡」。', tips: ['在「我的 → 小芽 AI」中完成设置'], sources: ['Bumpling 演示数据'], seekCare: false },
+    en: { verdict: 'info', title: 'Demo-mode sample answer', answer: 'This is an offline sample showing the answer format: a verdict first, then key points and sources.\n- Connect your own Gemini or OpenAI-compatible key and Bumpling will answer your real question in context.\n- Try "Can I eat crab?", "Can I use a retinol cream?" or "How much coffee is OK?".', tips: ['Set it up under Me → Bumpling AI'], sources: ['Bumpling demo data'], seekCare: false },
+  };
+  const DEMO_PHOTO = {
+    zh: { verdict: 'caution', title: '照片识别（演示）', answer: '演示模式无法真正识别图片。连接 AI 服务后，小芽会读取照片中的食物、产品名称和成分表，再给出孕期建议。', tips: ['拍清楚成分表或食物整体'], sources: ['Bumpling 演示数据'], seekCare: false },
+    en: { verdict: 'caution', title: 'Photo recognition (demo)', answer: 'Demo mode cannot read images. Once connected, Bumpling reads the food, product name and ingredient list in the photo before answering.', tips: ['Photograph the ingredient list clearly'], sources: ['Bumpling demo data'], seekCare: false },
+  };
+  function demoAnswer(text, images, audio) {
+    const L = I18N.lang === 'zh' ? 'zh' : 'en';
+    if (images && images.length && !text) return normAnswer(DEMO_PHOTO[L]);
+    const hit = DEMO_QA.find(q => q.k.test(text || ''));
+    const a = normAnswer(hit ? hit[L] : DEMO_DEFAULT[L]);
+    if (audio && !text) a.transcript = L === 'zh' ? '（演示）孕妇可以吃螃蟹吗？' : '(demo) Can I eat crab while pregnant?';
+    return a;
+  }
+  const DEMO_MEAL = {
+    get items() { const zh = I18N.lang === 'zh'; return [
+      { name: zh ? '米饭' : 'Steamed rice', grams: 150, kcal: 174, protein: 3.9, carb: 38.9, fat: 0.5, fibre: 0.6, folate: 4, iron: 0.3, calcium: 10, iodine: 0, dha: 0, caffeine: 0, confidence: 'high' },
+      { name: zh ? '清蒸鲈鱼' : 'Steamed sea bass', grams: 100, kcal: 105, protein: 18.6, carb: 0, fat: 3.4, fibre: 0, folate: 8, iron: 2.0, calcium: 138, iodine: 15, dha: 240, caffeine: 0, confidence: 'medium' },
+      { name: zh ? '蒜蓉西兰花' : 'Garlic broccoli', grams: 90, kcal: 45, protein: 3.7, carb: 4.5, fat: 2.0, fibre: 2.3, folate: 97, iron: 0.9, calcium: 60, iodine: 1, dha: 0, caffeine: 0, confidence: 'high' },
+      { name: zh ? '番茄蛋汤' : 'Tomato & egg soup', grams: 200, kcal: 62, protein: 3.6, carb: 3.2, fat: 3.8, fibre: 0.6, folate: 22, iron: 0.8, calcium: 24, iodine: 8, dha: 15, caffeine: 0, confidence: 'low' },
+      { name: zh ? '拿铁' : 'Latte', grams: 355, kcal: 150, protein: 8, carb: 12, fat: 7, fibre: 0, folate: 14, iron: 0.2, calcium: 270, iodine: 40, dha: 0, caffeine: 150, confidence: 'high' },
+    ]; },
+    notes: { zh: '演示数据：一份典型的中式午餐。连接 AI 服务后会按你的照片识别。', en: 'Demo data: a typical Chinese lunch. Connect an AI service to analyse your own photo.' },
+  };
+  function demoImport(kind) {
+    const zh = I18N.lang === 'zh';
+    const d = n => Store.todayStr(new Date(Date.now() - n * 86400000));
+    const meals = [
+      { date: d(1), meal: 'breakfast', name: zh ? '牛奶 + 全麦面包' : 'Milk + wholegrain toast', grams: 300, kcal: 290, protein: 14, carb: 40, fat: 8, fibre: 4, folate: 40, iron: 1.6, calcium: 300, iodine: 50, dha: 0, caffeine: 0 },
+      { date: d(1), meal: 'lunch', name: zh ? '鸡胸肉沙拉' : 'Chicken salad', grams: 320, kcal: 380, protein: 32, carb: 18, fat: 19, fibre: 5, folate: 90, iron: 2.2, calcium: 70, iodine: 5, dha: 0, caffeine: 0 },
+      { date: d(2), meal: 'dinner', name: zh ? '番茄牛腩面' : 'Tomato beef noodles', grams: 450, kcal: 560, protein: 28, carb: 72, fat: 16, fibre: 4, folate: 45, iron: 3.6, calcium: 50, iodine: 6, dha: 0, caffeine: 0 },
+    ];
+    const workouts = [
+      { date: d(1), type: 'walk', minutes: 35, note: zh ? '晚饭后散步' : 'After-dinner walk' },
+      { date: d(2), type: 'yoga', minutes: 25, note: zh ? '孕期瑜伽' : 'Prenatal yoga' },
+    ];
+    return { meals: kind === 'exercise' ? [] : meals, workouts: kind === 'diet' ? [] : workouts, notes: zh ? '演示数据。' : 'Demo data.' };
+  }
+
+  global.AI = { AIError, status, isReady, ask, analyzeMeal, importHistory, listModels, test, errorKey, compressImage, thumb, fileToDataURL, itemNutrients, parseJSON, partialAnswer, normItems, normImport, matchFood, normName, imageHash, NUT_KEYS, MICRO_KEYS, MEALS, WORKOUT_TYPES, GEMINI_BASE, OPENAI_BASE, TIMEOUT_MS };
 })(window);

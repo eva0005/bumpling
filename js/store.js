@@ -26,15 +26,18 @@
       lossMode: false,
       reminderDays: 3,
       notify: false,
-      ai: { endpoint: '', key: '', model: '' },   // 小芽AI: optional bring-your-own OpenAI-compatible service
+      // 小芽 AI (v1.2) — provider credentials live only on this device and are stripped from exports.
+      ai: { provider: 'gemini', apiKey: '', model: 'gemini-2.5-flash', baseUrl: '', consent: false, shareContext: true, demo: false },
     },
     profile: {
       lmp: null, edd: null, heightCm: null, preWeightKg: null, age: null, multiple: false,
       conditions: [], orders: [],
     },
     weights: [],      // {date:'YYYY-MM-DD', kg}
-    meals: [],        // {date, meal:'breakfast'|..., foodId, grams, ts}
-    workouts: [],     // {date, type, minutes, ts}
+    meals: [],        // {date, meal:'breakfast'|..., foodId, grams, ts} — or AI/custom entries: {date, meal, name, grams, n:{kcal,protein,carb,fat,fibre,...}, src:'photo'|'import', ts}
+    workouts: [],     // {date, type, minutes, ts, src?}
+    aiChats: [],      // 小芽 AI conversation: {id, role:'user'|'ai', ts, text, thumbs?:[dataURL], hadPhoto?, data?:{verdict,title,tips,sources,seekCare}, demo?, error?}
+    imports: [],      // fingerprints of images already imported: {hash, ts}
     bp: [],           // {ts, sys, dia}
     glucose: [],      // {ts, type:'fasting'|'pp1'|'pp2', mmol}
     symptoms: [],     // {ts, tags:[], note}
@@ -48,7 +51,6 @@
     exerciseScreen: null, // {ts, flags:[]}
     family: { code: null, perms: { week: true, checkup: true, alerts: true, weight: false } },
     weeklyGoalStreak: 0,
-    aiChat: [],       // {id, role:'user'|'ai', text, photoId?, ts} — capped in ui
   });
 
   let state = null;
@@ -76,10 +78,26 @@
     }
     return state;
   }
+  let saveFailed = false;
   function save() {
-    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { console.warn('Store: save failed', e); }
+    let ok = true;
+    try { localStorage.setItem(KEY, JSON.stringify(state)); }
+    catch (e) {
+      ok = false; console.warn('Store: save failed', e);
+      // Quota exceeded: drop AI chat thumbnails (the only bulky payload), then retry once.
+      try {
+        let freed = false;
+        for (const m of (state.aiChats || [])) if (m.thumbs && m.thumbs.length) { m.thumbs = []; m.hadPhoto = true; freed = true; }
+        if (freed) { localStorage.setItem(KEY, JSON.stringify(state)); ok = true; }
+      } catch (e2) { /* still failing */ }
+    }
+    if (!ok && !saveFailed && global.UI && global.UI.toast) { try { global.UI.toast(global.t('store.full'), 'danger'); } catch (e) { /* ignore */ } }
+    saveFailed = !ok;
     listeners.forEach(fn => { try { fn(state); } catch (e) { console.error(e); } });
+    return ok;
   }
+  // Rough size of the persisted blob (bytes), for the settings screen.
+  function usage() { const raw = localStorage.getItem(KEY) || ''; try { const b = new Blob([raw]); if (typeof b.size === 'number') return b.size; } catch (e) { /* fall through */ } return raw.length; }
   function update(fn) { fn(state); save(); return state; }
 
   const todayStr = (d = new Date()) => {
@@ -88,17 +106,23 @@
   };
 
   global.Store = {
-    load, save, update,
+    load, save, update, usage,
+    get saveFailed() { return saveFailed; },
     get state() { return state || load(); },
     subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
     todayStr,
     exportJSON() {
-      return JSON.stringify(Object.assign({ exportedAt: new Date().toISOString(), app: 'Bumpling' }, state), null, 2);
+      // Never export AI credentials — they belong to this device only.
+      const copy = JSON.parse(JSON.stringify(state));
+      if (copy.settings && copy.settings.ai) copy.settings.ai.apiKey = '';
+      return JSON.stringify(Object.assign({ exportedAt: new Date().toISOString(), app: 'Bumpling' }, copy), null, 2);
     },
     importJSON(text) {
       const data = JSON.parse(text);
       if (!data || typeof data !== 'object' || !data.settings || !data.profile) throw new Error('invalid');
+      const keepKey = state && state.settings && state.settings.ai ? state.settings.ai.apiKey : '';
       state = deepMerge(defaults(), data);
+      if (keepKey && !state.settings.ai.apiKey) state.settings.ai.apiKey = keepKey; // exports never carry the key
       save();
     },
     wipe() {

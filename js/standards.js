@@ -43,48 +43,48 @@
   const NUT_CN = { // Chinese DRIs 2023
     energyExtra: [0, 250, 400],
     protein: [55, 70, 85],            // g
-    fiber: 25,                        // g/day AI
     folate: [600, 600, 600],          // μg DFE (incl. 400 μg supplement)
     iron: [20, 24, 29],               // mg
     calcium: [800, 1000, 1000],       // mg
     iodine: [230, 230, 230],          // μg
     dha: [200, 200, 200],             // mg
+    fibre: [25, 25, 25],              // g (DRIs 2023 AI 25–30 g/d)
     caffeineMax: 200,                 // mg
     sourceKey: 'src.cn.nutrition',
   };
   const NUT_US = { // IOM DRIs / ACOG
     energyExtra: [0, 340, 452],
     protein: [71, 71, 71],
-    fiber: 28,                        // g/day AI (IOM)
     folate: [600, 600, 600],
     iron: [27, 27, 27],
     calcium: [1000, 1000, 1000],
     iodine: [220, 220, 220],
     dha: [200, 200, 200],
+    fibre: [28, 28, 28],              // g (IOM AI, pregnancy)
     caffeineMax: 200,
     sourceKey: 'src.us.nutrition',
   };
   const NUT_UK = { // NHS / NICE / SACN
     energyExtra: [0, 0, 200],
     protein: [51, 51, 51],
-    fiber: 30,                        // g/day (SACN)
     folate: [400, 400, 400],          // folic acid supplement until 12 wks; dietary folate ~300 μg
     iron: [14.8, 14.8, 14.8],
     calcium: [700, 700, 700],
     iodine: [140, 140, 140],
     dha: [200, 200, 200],
+    fibre: [30, 30, 30],              // g (SACN 2015)
     caffeineMax: 200,
     sourceKey: 'src.uk.nutrition',
   };
   const NUT_INTL = { // WHO + IOM
     energyExtra: [0, 340, 452],
     protein: [71, 71, 71],
-    fiber: 25,                        // g/day (WHO ≥25 g)
     folate: [400, 400, 400],
     iron: [30, 30, 30],
     calcium: [1000, 1000, 1000],
     iodine: [250, 250, 250],
     dha: [200, 200, 200],
+    fibre: [28, 28, 28],              // g (IOM AI)
     caffeineMax: 200,
     sourceKey: 'src.intl.nutrition',
   };

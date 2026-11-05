@@ -54,7 +54,7 @@
         <div class="row between mt-2 meta"><span>${g && g.daysLeft >= 0 ? esc(t('home.daysLeft', { n: g.daysLeft })) : esc(t('home.overdue', { n: g ? -g.daysLeft : 0 }))}</span><span>${esc(t('home.edd', { d: fmtDate(g && g.edd) }))}</span></div>
       </section>
 
-      ${(() => { const m = Mascot.say(st); return `<section class="companion mt-3" aria-label="${esc(t('mascot.name'))}" data-mood="${m.mood}"><button class="mascot-btn" data-act="poke" aria-label="${esc(t('mascot.name'))}" style="border:0;background:none;padding:0">${Mascot.mascot({ size: 72, mood: m.mood })}</button><div class="bubble"><div class="who">${esc(t('mascot.name'))}</div><div class="say">${esc(m.text)}</div></div></section>`; })()}
+      ${(() => { const m = Mascot.say(st); return `<section class="companion mt-3" aria-label="${esc(t('mascot.name'))}" data-mood="${m.mood}"><button class="mascot-btn" data-act="poke" aria-label="${esc(t('mascot.name'))}" style="border:0;background:none;padding:0">${Mascot.mascot({ size: 72, mood: m.mood })}</button><div class="bubble"><div class="who">${esc(t('mascot.name'))}</div><div class="say">${esc(m.text)}</div><a class="ask" href="#/ai" id="btn-ask-ai">${icon('sparkle')}${esc(t('home.ask'))}</a></div></section>`; })()}
 
       ${(() => { const up = Engine.upcomingReminders(st); if (!up.length) return ''; const u = up[0]; const msg = u.daysUntil === 0 ? t('g.rem.banner.today', { t: u.title }) : u.daysUntil === 1 ? t('g.rem.banner.tomorrow', { t: u.title }) : t('g.rem.banner.soon', { n: u.daysUntil, t: u.title }); return `<a class="alert info mt-3" href="#/calendar" style="text-decoration:none;color:inherit"><div class="ic">${icon('calendar')}</div><div class="grow"><div class="t">${esc(msg)}</div><div class="d">${u.scheduled ? esc(UI.fmtDate(u.dueDate, { month: 'short', day: 'numeric', weekday: 'short' }) + (u.scheduled.time ? ' ' + u.scheduled.time : '') + (u.scheduled.place ? ' · ' + u.scheduled.place : '')) : esc(t('g.cal.window', { w: t('week.only', { w: u.from === u.to ? u.from : u.from + '–' + u.to }) }))}${up.length > 1 ? ` · +${up.length - 1}` : ''}</div></div>${icon('chevR', 'chev')}</a>`; })()}
 
@@ -66,7 +66,7 @@
         <div class="quote-src">— ${esc(L(q.src))}</div></section>`; })()}
 
       <nav class="quick mt-3" aria-label="Quick actions">
-        <button data-go="#/ai"><span class="ic coral">${icon('sparkle')}</span>${esc(t('home.quick.ai'))}</button>
+        <button data-go="#/ai" id="quick-ai"><span class="ic">${icon('sparkle')}</span>${esc(t('home.quick.ai'))}</button>
         <button data-go="#/calendar"><span class="ic">${icon('calendar')}</span>${esc(t('home.quick.calendar'))}</button>
         <button data-go="#/exercise"><span class="ic sky">${icon('activity')}</span>${esc(t('home.quick.exercise'))}</button>
         <button data-go="#/tools"><span class="ic sun">${icon('pulse')}</span>${esc(t('home.quick.tools'))}</button>

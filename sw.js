@@ -1,8 +1,8 @@
 /* Minimal offline-first service worker: cache app shell, network-first for fonts. */
-const CACHE = 'bumpling-v2';
+const CACHE = 'bumpling-v3';
 const SHELL = [
   './', './index.html', './css/index.css', './manifest.webmanifest',
-  './js/i18n.js', './js/standards.js', './js/content.js', './js/store.js', './js/engine.js', './js/ui.js', './js/photos.js', './js/ai.js', './js/mascot.js', './icon.svg', './icon-maskable.svg', './apple-touch-icon.png', './icon-192.png', './icon-512.png',
+  './js/i18n.js', './js/standards.js', './js/content.js', './js/store.js', './js/engine.js', './js/ui.js', './js/mascot.js', './js/ai.js', './icon.svg', './icon-maskable.svg', './apple-touch-icon.png', './icon-192.png', './icon-512.png',
   './js/views/onboarding.js', './js/views/home.js', './js/views/weight.js', './js/views/diet.js',
   './js/views/exercise.js', './js/views/guide.js', './js/views/tools.js', './js/views/me.js', './js/views/ai.js', './js/app.js',
 ];

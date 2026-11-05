@@ -134,25 +134,34 @@
     const e = energyTarget(state, date);
     return {
       kcal: e.total, protein: n.protein[i], carb: Math.round(e.total * 0.5 / 4), fat: Math.round(e.total * 0.3 / 9),
-      fiber: n.fiber || 28,
+      fibre: n.fibre ? n.fibre[i] : 25,
       folate: n.folate[i], iron: n.iron[i], calcium: n.calcium[i], iodine: n.iodine[i], dha: n.dha[i], caffeineMax: n.caffeineMax,
       sourceKey: n.sourceKey,
     };
   }
+  // Nutrients of one logged meal entry: database food (foodId + grams) or AI/custom entry (absolute values in m.n).
+  function entryNutrients(m) {
+    const out = {};
+    if (m.n && typeof m.n === 'object') { for (const k of Content.NUTRIENT_KEYS) out[k] = +m.n[k] || 0; return out; }
+    const food = Content.FOODS.find(f => f.id === m.foodId);
+    return food ? Content.foodNutrients(food, m.grams) : null;
+  }
   function dayIntake(state, dateStr) {
-    const sum = { kcal: 0, protein: 0, carb: 0, fat: 0, fiber: 0, folate: 0, iron: 0, calcium: 0, iodine: 0, dha: 0, caffeine: 0 };
+    const sum = {}; for (const k of Content.NUTRIENT_KEYS) sum[k] = 0;
     for (const m of state.meals) {
       if (m.date !== dateStr) continue;
-      let n = null;
-      if (m.custom && m.grams) n = Content.customNutrients(m.custom, m.grams); // AI-estimated / free-form food
-      else {
-        const food = Content.FOODS.find(f => f.id === m.foodId);
-        if (!food) continue;
-        n = Content.foodNutrients(food, m.grams);
-      }
+      const n = entryNutrients(m);
+      if (!n) continue;
       for (const k in sum) sum[k] += n[k] || 0;
     }
     return sum;
+  }
+  // Share of energy from protein / carbohydrate / fat (4 / 4 / 9 kcal per g). Null when nothing is logged.
+  function macroSplit(n) {
+    const p = (n.protein || 0) * 4, c = (n.carb || 0) * 4, f = (n.fat || 0) * 9, total = p + c + f;
+    if (total <= 0) return null;
+    const protein = Math.round(p / total * 100), carb = Math.round(c / total * 100);
+    return { protein, carb, fat: Math.max(0, 100 - protein - carb), kcalFromMacros: total };
   }
 
   // --- Exercise ---------------------------------------------------------------
@@ -313,7 +322,7 @@
   global.Engine = {
     DAY, parseDate, fmtDate, addDays, diffDays, lmpDate, eddDate, gestAge, weekOfDate, bmi, gainBand,
     sortedWeights, latestWeight, gainStatus, weeklyRate, deviation,
-    energyTarget, nutrientTargets, dayIntake, weekStart, weekMinutes, exerciseLocked,
+    energyTarget, nutrientTargets, entryNutrients, dayIntake, macroSplit, weekStart, weekMinutes, exerciseLocked,
     checkupList, nextCheckup, upcomingReminders, checkupsOnDate, checkupsICS, alerts, contractionStats, report,
   };
 })(window);

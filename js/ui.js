@@ -48,10 +48,15 @@
     edit: '<path d="M4 20h4l10-10-4-4L4 16z"/><path d="m13 7 4 4"/>',
     refresh: '<path d="M20 11a8 8 0 0 0-14.5-4M4 13a8 8 0 0 0 14.5 4"/><path d="M20 4v7h-7M4 20v-7h7"/>',
     sparkle: '<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 17l.8 2.2L22 20l-2.2.8L19 23l-.8-2.2L16 20l2.2-.8z"/>',
-    camera: '<path d="M3 8a2 2 0 0 1 2-2h2l2-3h6l2 3h2a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><circle cx="12" cy="13" r="3.5"/>',
-    mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/>',
-    send: '<path d="m4.5 11.5 15-7-4.2 14-3.3-5.6z"/><path d="M12 13l7.5-8.5"/>',
-    speaker: '<path d="M4 9v6h4l5 4V5L8 9z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/>',
+    camera: '<path d="M4 8h3l2-3h6l2 3h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V9a1 1 0 0 1 1-1z"/><circle cx="12" cy="13" r="3.5"/>',
+    mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6"/>',
+    send: '<path d="M4 12 20 4l-4 16-4-7z"/><path d="M12 13 20 4"/>',
+    image: '<rect x="3" y="5" width="18" height="14" rx="3"/><circle cx="9" cy="10" r="1.6"/><path d="m4 18 5-5 3 3 3-4 5 6"/>',
+    stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
+    eye: '<path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
+    eyeOff: '<path d="M3 3l18 18M10.6 6.3A10 10 0 0 1 12 6c6.5 0 10 6 10 6a17 17 0 0 1-3.2 3.7M6.6 6.6A16 16 0 0 0 2 12s3.5 6 10 6a9.6 9.6 0 0 0 4-.8"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/>',
+    wand: '<path d="m4 20 11-11M13 5l1 2 2 1-2 1-1 2-1-2-2-1 2-1zM19 11l.6 1.4L21 13l-1.4.6L19 15l-.6-1.4L17 13l1.4-.6z"/>',
+    link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1"/><path d="M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
   };
   const icon = (name, cls = '') => `<svg class="ic-svg ${cls}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${P[name] || ''}</svg>`;
 
@@ -139,13 +144,31 @@
   function topbar(title, back = true, right = '') {
     return `<header class="topbar">${back ? `<button class="back" data-act="back" aria-label="${esc(t('c.back'))}">${icon('chevL')}</button>` : ''}<h1>${esc(title)}</h1>${right}</header>`;
   }
+  // Minimal, safe rich text for AI answers: escapes HTML first, then supports **bold**, "- " bullets and blank-line paragraphs.
+  function mdLite(text) {
+    const lines = String(text == null ? '' : text).replace(/\r/g, '').split('\n');
+    let html = '', para = [], list = [];
+    const inline = s => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+    const flushP = () => { if (para.length) { html += `<p>${para.map(inline).join('<br>')}</p>`; para = []; } };
+    const flushL = () => { if (list.length) { html += `<ul>${list.map(x => `<li>${inline(x)}</li>`).join('')}</ul>`; list = []; } };
+    for (const raw of lines) {
+      const line = raw.trim();
+      const m = line.match(/^(?:[-*•]|\d+[.、)])\s+(.*)$/);
+      if (m) { flushP(); list.push(m[1]); }
+      else if (!line) { flushP(); flushL(); }
+      else { flushL(); para.push(line.replace(/^#+\s*/, '')); }
+    }
+    flushP(); flushL();
+    return html;
+  }
+  const spinner = (cls = '') => `<span class="spinner ${cls}" aria-hidden="true"></span>`;
 
   // --- Sheets / confirm / toast ------------------------------------------------
   function sheet({ title, body, actions, onMount, wide }) {
     const bd = document.createElement('div');
     bd.className = 'sheet-backdrop';
     bd.innerHTML = `<div class="sheet" role="dialog" aria-modal="true" ${title ? `aria-label="${esc(title)}"` : ''}><div class="grab"></div>${title ? `<h2>${esc(title)}</h2>` : ''}<div class="sheet-body">${body}</div>${actions ? `<div class="sheet-actions">${actions}</div>` : ''}</div>`;
-    const close = () => { bd.remove(); document.removeEventListener('keydown', onKey); };
+    const close = () => { try { bd.dispatchEvent(new CustomEvent('sheet-close')); } catch (e) { /* ignore */ } bd.remove(); document.removeEventListener('keydown', onKey); };
     const onKey = e => { if (e.key === 'Escape') close(); };
     bd.addEventListener('click', e => { if (e.target === bd) close(); });
     document.addEventListener('keydown', onKey);
@@ -153,7 +176,7 @@
     const s = bd.querySelector('.sheet');
     if (onMount) onMount(s, close);
     s.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', close));
-    const first = s.querySelector('input,select,button');
+    const first = s.querySelector('input:not([type="file"]):not(.sr-only),select,textarea,button:not([data-close])');
     if (first && !wide) setTimeout(() => first.focus(), 50);
     return close;
   }
@@ -171,7 +194,7 @@
   }
   let toastWrap;
   function toast(msg, kind = '') {
-    if (!toastWrap) { toastWrap = document.createElement('div'); toastWrap.className = 'toast-wrap'; document.body.appendChild(toastWrap); }
+    if (!toastWrap || toastWrap.isConnected === false) { toastWrap = document.createElement('div'); toastWrap.className = 'toast-wrap'; document.body.appendChild(toastWrap); }
     const el = document.createElement('div'); el.className = `toast ${kind}`; el.textContent = msg; el.setAttribute('role', 'status');
     toastWrap.appendChild(el);
     setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity 200ms'; setTimeout(() => el.remove(), 220); }, 2200);
@@ -200,6 +223,7 @@
   // app also works inside sandboxed iframes / previews where hash navigation may be blocked.
   const Views = {};
   const TAB_FOR = { home: 'home', weight: 'weight', diet: 'diet', guide: 'guide', me: 'me', calendar: 'guide', week: 'guide', kicks: 'guide', contractions: 'guide', exercise: 'home', tools: 'home', report: 'me', ai: 'home' };
+  const NO_TAB = ['onboarding', 'report', 'ai']; // full-height screens without the tab bar
   let route = '#/home';
   const history_ = [];
   function readHash() { try { return location.hash || ''; } catch (e) { return ''; } }
@@ -221,11 +245,15 @@
     if (!st.onboarded && name !== 'onboarding') { route = '#/onboarding'; name = 'onboarding'; params = []; writeHash(route); }
     else if (st.onboarded && name === 'onboarding' && params[0] !== 'edit') { route = '#/home'; name = 'home'; params = []; writeHash(route); }
     const view = Views[name] || Views.home;
+    const prev = Views[currentView];
+    if (prev && prev !== view && prev.unmount) { try { prev.unmount(); } catch (e) { console.warn(e); } }
     currentView = name;
-    const noTab = name === 'onboarding' || name === 'report';
+    const noTab = NO_TAB.includes(name);
     try {
-      app.innerHTML = `<main class="view ${noTab ? 'no-tab' : ''}" id="view-${esc(name)}">${view.render(params)}</main>${noTab ? '' : tabbar(TAB_FOR[name] || name)}`;
-      try { window.scrollTo(0, 0); } catch (e) { /* ignore */ }
+      // The app shell is a fixed-height flex column: <main> scrolls on its own and the tab bar is a
+      // separate footer, so content can never be hidden behind it (and the bar never moves).
+      app.innerHTML = `<main class="view ${noTab ? 'no-tab' : ''} view-${esc(name)}" id="view-${esc(name)}">${view.render(params)}</main>${noTab ? '' : tabbar(TAB_FOR[name] || name)}`;
+      try { const m = app.querySelector('main'); if (m) m.scrollTop = 0; window.scrollTo(0, 0); } catch (e) { /* ignore */ }
       if (view.mount) view.mount(app.querySelector('main'), params);
     } catch (e) {
       console.error(e);
@@ -237,7 +265,7 @@
   function tabbar(active) {
     const tabs = [['home', 'home'], ['weight', 'scale'], ['diet', 'food'], ['guide', 'calendar'], ['me', 'user']];
     const hasAlert = Engine.alerts(Store.state).some(a => a.level === 'urgent');
-    return `<nav class="tabbar" aria-label="Main">${tabs.map(([k, ic]) => `<a class="tab ${active === k ? 'active' : ''}" href="#/${k}" id="tab-${k}">${k === 'home' && hasAlert ? '<i class="dot"></i>' : ''}${icon(ic)}<span>${esc(t('tab.' + k))}</span></a>`).join('')}</nav>`;
+    return `<div class="tabbar-wrap"><nav class="tabbar" aria-label="Main">${tabs.map(([k, ic]) => `<a class="tab ${active === k ? 'active' : ''}" href="#/${k}" id="tab-${k}">${k === 'home' && hasAlert ? '<i class="dot"></i>' : ''}${icon(ic)}<span>${esc(t('tab.' + k))}</span></a>`).join('')}</nav></div>`;
   }
   function go(hash) {
     if (hash !== route) { history_.push(route); if (history_.length > 50) history_.shift(); }
@@ -260,5 +288,5 @@
   });
 
   global.UI = { esc, L, icon, fmtWeek, fmtWeight, fmtDelta, weightToKg, fmtHeight, fmtGlucose, glucoseToMmol, fmtEnergy, fmtDate, fmtDateLong, fmtTime, fmtRelDay, fmtDuration, regionName,
-    stdBadge, sourceNote, alertCard, ring, topbar, sheet, confirm, toast, whyStandard, Views, render, go, back, syncFromHash, init, download, r1, r0, parseHash, timer, get currentView() { return currentView; } };
+    stdBadge, sourceNote, alertCard, ring, topbar, mdLite, spinner, sheet, confirm, toast, whyStandard, Views, render, go, back, syncFromHash, init, download, r1, r0, parseHash, timer, get currentView() { return currentView; } };
 })(window);
